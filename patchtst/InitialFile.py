@@ -14,15 +14,19 @@ print("Current working directory:", Path.cwd())
 
 daily_survey_onehot_data_path = DATA_PATH / "daily_surveys_onehot.csv"
 
+fitbit_day_level_activity_path = DATA_PATH / 'fitbit_day_level_activity.csv'
+
 print(daily_survey_onehot_data_path)
 
 import pandas as pd
 
 datasurvey = pd.read_csv(daily_survey_onehot_data_path)
 
+fitbitDay = pd.read_csv(fitbit_day_level_activity_path )
 
-datasurvey.head()
+len(datasurvey.columns)
 
+fitbitDay.head()
 
 for item in Path.cwd().iterdir():
     size = item.stat().st_size
