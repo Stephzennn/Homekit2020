@@ -24,7 +24,7 @@ datasurvey = pd.read_csv(daily_survey_onehot_data_path)
 
 fitbitDay = pd.read_csv(fitbit_day_level_activity_path )
 
-hourlyTrainDataPath = DATA_PATH ./data/processed/split_2020_02_10/train_7_day_hourly
+hourlyTrainDataPath = DATA_PATH /data/processed/split_2020_02_10/train_7_day_hourly
 
 len(datasurvey.columns)
 
@@ -45,3 +45,12 @@ df = spark.read.parquet("../data/processed/split_2020_02_10/train_7_day_hourly")
 
 df.printSchema()
 df.show(5)
+
+import pandas as pd
+
+df = pd.read_parquet(
+    "../data/processed/split_2020_02_10/train/date=2019-12-15"
+)
+
+print(df.head())
+print(df.columns)
