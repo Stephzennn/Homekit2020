@@ -24,6 +24,8 @@ datasurvey = pd.read_csv(daily_survey_onehot_data_path)
 
 fitbitDay = pd.read_csv(fitbit_day_level_activity_path )
 
+hourlyTrainDataPath = DATA_PATH ./data/processed/split_2020_02_10/train_7_day_hourly
+
 len(datasurvey.columns)
 
 fitbitDay.head()
@@ -31,3 +33,15 @@ fitbitDay.head()
 for item in Path.cwd().iterdir():
     size = item.stat().st_size
     print(f"{item.name}  |  {size} bytes")
+    
+    
+    
+    
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.getOrCreate()
+
+df = spark.read.parquet("../data/processed/split_2020_02_10/train_7_day_hourly")
+
+df.printSchema()
+df.show(5)
