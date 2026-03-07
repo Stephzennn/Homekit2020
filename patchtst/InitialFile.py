@@ -52,5 +52,30 @@ df = pd.read_parquet(
     "../data/processed/split_2020_02_10/train/date=2019-12-15"
 )
 
+bypeople = pd.read_parquet(
+    "../data/processed/split_2020_02_10_by_user/train/date=2019-12-15"
+)
+
+
 print(df.head())
 print(df.columns)
+
+
+participants = set(bypeople['participant_id'])
+
+len(participants) 
+
+
+print(bypeople.head())
+
+print(bypeople.tail())
+
+
+import pandas as pd
+
+df = pd.read_csv(
+    "../data/processed/by_people_train_all_dates.csv",
+    nrows=10
+)
+
+print(df)
