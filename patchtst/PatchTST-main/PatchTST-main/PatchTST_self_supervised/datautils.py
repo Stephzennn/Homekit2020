@@ -6,6 +6,25 @@ import torch
 from torch import nn
 import sys
 
+
+#---------------------------
+
+import torch
+import time
+
+device = torch.device("cuda")
+
+print("GPU:", torch.cuda.get_device_name(0))
+
+import os, socket, torch
+
+#socket.sethostname("ezg6@login-ice-1 projects")  #login-ice-1.pace.gatech.edu
+print(socket.gethostname())
+print(torch.__version__)
+print(torch.cuda.is_available())
+
+#---------------------------------------
+
 from src.data.datamodule import DataLoaders
 from src.data.pred_dataset import *
 
