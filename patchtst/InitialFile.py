@@ -52,12 +52,53 @@ df = pd.read_parquet(
     "../data/processed/split_2020_02_10/train/date=2019-12-15"
 )
 
-bypeople = pd.read_parquet(
-    "../data/processed/split_2020_02_10_by_user/train/date=2019-12-15"
+dfCSV = pd.read_csv(
+    "../data/processed/fitbit_day_level_activity.csv"
 )
 
 
+print(dfCSV.columns)
+
+
+dfCSV2 = pd.read_csv(
+    "../data/processed/lab_results_with_triggerdate.csv"
+)
+print(dfCSV2.head())
+
+small3 = dfCSV2.head(30)
+
+
+dfCSV3 = pd.read_csv(
+    "../data/processed/daily_surveys_onehot.csv"
+)
+print(dfCSV3.head())
+
+small = dfCSV3.head()
+
+bypeople = pd.read_parquet(
+    "../data/processed/split_2020_02_10_by_user/train_7_day"
+)
+
+
+bypeople =  pd.read_parquet(
+    "../data/processed/split_2020_02_10_by_user/train_7_day/.part-00000-e13c451f-9bc0-4dda-84a7-b9971e0a7924-c000.snappy.parquet"
+)
+
+
+
+#/home/hice1/ezg6/projects/Homekit2020/data/processed/split_2020_02_10_by_user/train_7_day/.part-00000-e13c451f-9bc0-4dda-84a7-b9971e0a7924-c000.snappy.parquet
+
+#import pandas as pd
+
+df = pd.read_parquet(
+    "part-00000-e13c451f-9bc0-4dda-84a7-b9971e0a7924-c000.snappy.parquet"
+)
+
 print(df.head())
+
+dd = bypeople[bypeople["participant_id"].str.contains("18ebe4d026fc2782df611fbfca8e11ff")]
+
+print(df.head(10))
 print(df.columns)
 
 
