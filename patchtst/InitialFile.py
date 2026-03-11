@@ -44,12 +44,13 @@ spark = SparkSession.builder.getOrCreate()
 df = spark.read.parquet("../data/processed/split_2020_02_10/train_7_day_hourly")
 
 df.printSchema()
-df.show(5)
+df.columns
 
 import pandas as pd
 
 df = pd.read_parquet(
-    "../data/processed/split_2020_02_10/train/date=2019-12-15"
+   
+    "../data/processed/split_2020_02_10_by_user/train_7_day/part-00000-e13c451f-9bc0-4dda-84a7-b9971e0a7924-c000.snappy.parquet"
 )
 
 dfCSV = pd.read_csv(
@@ -61,9 +62,11 @@ print(dfCSV.columns)
 
 
 dfCSV2 = pd.read_csv(
-    "../data/processed/lab_results_with_triggerdate.csv"
+    "../data/processed/fitbit_day_level_activity.csv"  
 )
 print(dfCSV2.head())
+
+dfCSV2.shape
 
 small3 = dfCSV2.head(30)
 
@@ -76,9 +79,9 @@ print(dfCSV3.head())
 small = dfCSV3.head()
 
 bypeople = pd.read_parquet(
-    "../data/processed/split_2020_02_10_by_user/train_7_day"
+    "../data/processed/full_dataset/date=2019-12-15"
 )
-
+#ff1f623ad0ad4d13816426b7fa6229c4.parquet
 
 bypeople =  pd.read_parquet(
     "../data/processed/split_2020_02_10_by_user/train_7_day/.part-00000-e13c451f-9bc0-4dda-84a7-b9971e0a7924-c000.snappy.parquet"
@@ -94,7 +97,7 @@ df = pd.read_parquet(
     "part-00000-e13c451f-9bc0-4dda-84a7-b9971e0a7924-c000.snappy.parquet"
 )
 
-print(df.head())
+print(bypeople.head())
 
 dd = bypeople[bypeople["participant_id"].str.contains("18ebe4d026fc2782df611fbfca8e11ff")]
 
