@@ -106,7 +106,13 @@ def Prepare_Data_for_PatchTSTV2(bypeople):
 
     bypeople.loc[match_idx, "InfectionStatus"] = 1
 
-    bypeople.to_csv(output_csvReal, index=False)
+    # Here the column is [participant_id,timestamp,steps,heart_rate,missing_heartrate,missing_steps,sleep_classic_0,sleep_classic_1,sleep_classic_2,sleep_classic_3,date,InfectionStatus]
+    bypeople.drop(columns=["date", "participant_id"], inplace=True)
+    bypeople.rename(columns={"timestamp": "date"}, inplace=True)
+    
+    # Here the final column should be [timestamp steps heart_rate missing_heartrate missing_steps sleep_classic_0 sleep_classic_1 sleep_classic_2 sleep_classic_3 InfectionStatus]
+    #bypeople.to_csv(output_csvReal, index=False) output_csv
+    bypeople.to_csv(output_csv, index=False) 
     print("Done")
 
 def main():
@@ -118,7 +124,7 @@ def main():
     )
     print(2)
     # Trial
-    """
+    #"""
     table = dataset.to_table(
         filter=(
             (ds.field("date") >= "2020-02-05") &
@@ -133,6 +139,7 @@ def main():
             (ds.field("date") <= "2020-06-29")
         )
     )
+    """
     print(3)
     bypeople = table.to_pandas()
     print(4)
