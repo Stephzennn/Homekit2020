@@ -401,10 +401,12 @@ class Learner(GetAttr):
             params[key] = val
         BaseEstimator.set_params(self, **params)
 
+    """
     def to_distributed(self,
                        sync_bn=True,  # Whether to replace all batch norm with `nn.SyncBatchNorm`
                        **kwargs
                        ):
+        print("Called")
         local_rank = int(os.environ.get('LOCAL_RANK'))
         world_size = int(os.environ.get('WORLD_SIZE'))
         rank = int(os.environ.get('RANK'))
@@ -412,6 +414,41 @@ class Learner(GetAttr):
             rank, torch.distributed.get_world_size()))
 
         self.add_callback(DistributedTrainer(local_rank=local_rank, world_size=world_size, sync_bn=sync_bn, **kwargs))
+
+        return self
+    """
+    def to_distributed(self,
+                   sync_bn=True,  # Whether to replace all batch norm with `nn.SyncBatchNorm`
+                   **kwargs
+                   ):
+        """
+        Enable distributed training for this learner.
+
+        Notes
+        -----
+        - torchrun provides LOCAL_RANK, RANK, and WORLD_SIZE as environment variables.
+        - At this point, the default process group may not be initialized yet.
+        Therefore, do NOT call torch.distributed.get_world_size() here.
+        - The actual process-group initialization is handled later by
+        DistributedTrainer.before_fit().
+        """
+        local_rank = int(os.environ.get('LOCAL_RANK'))
+        world_size = int(os.environ.get('WORLD_SIZE'))
+        rank = int(os.environ.get('RANK'))
+
+        # Use the environment variable world_size directly here.
+        # Calling torch.distributed.get_world_size() before init_process_group()
+        # will raise an error.
+        print(f"Process {rank} (out of {world_size})")
+
+        self.add_callback(
+            DistributedTrainer(
+                local_rank=local_rank,
+                world_size=world_size,
+                sync_bn=sync_bn,
+                **kwargs
+            )
+        )
 
         return self
 

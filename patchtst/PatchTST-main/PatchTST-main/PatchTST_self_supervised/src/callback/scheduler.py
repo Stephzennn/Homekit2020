@@ -22,7 +22,8 @@ class OneCycleLR(Callback):
                         final_div_factor=1e4,
                         three_phase=False,
                         last_epoch=-1,
-                        verbose=False):
+                        #verbose=False
+                        ):
 
         super().__init__()        
         self.lr_max = lr_max if lr_max else self.lr  
@@ -33,7 +34,7 @@ class OneCycleLR(Callback):
         self.div_factor, self.final_div_factor = div_factor, final_div_factor
         self.three_phase = three_phase
         self.last_epoch = last_epoch
-        self.verbose = verbose
+        #self.verbose = verbose
                 
 
     def before_fit(self):
@@ -54,14 +55,21 @@ class OneCycleLR(Callback):
                                             final_div_factor=self.final_div_factor,
                                             three_phase=self.three_phase,
                                             last_epoch=self.last_epoch,
-                                            verbose=self.verbose
+                                           # verbose=self.verbose
                                             )
-
+    """
     def after_batch_train(self):
         if self.model.training: 
             self.scheduler.step()
             self.lrs.append( self.scheduler.get_last_lr()[0] )                  
-
+    """
+    def after_batch_train(self):
+        if self.model.training:
+            self.scheduler.step()
+            current_lr = self.scheduler.get_last_lr()[0]
+            self.lrs.append(current_lr)
+            if (self.iter == 0 or self.iter == len(self.dl) - 1):
+                print(f"epoch={self.epoch}, iter={self.iter}, lr={current_lr:.8f}")
     def after_fit(self):        
         self.learner.scheduled_lrs = self.lrs
                 

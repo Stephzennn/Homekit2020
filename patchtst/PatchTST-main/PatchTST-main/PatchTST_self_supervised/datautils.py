@@ -31,7 +31,7 @@ from src.data.pred_dataset import *
 DSETS = [
     'ettm1', 'ettm2', 'etth1', 'etth2',
     'electricity', 'traffic', 'illness',
-    'weather', 'exchange', 'wearable'
+    'weather', 'exchange', 'Wearable'
 ]
 
 
@@ -282,14 +282,14 @@ def get_dls(params):
         
     #Custom Dataset 
     elif params.dset == 'Wearable':
-        root_path = './Homekit2020/data/processed/'  
+        root_path = './Homekit2020/data/processed/'
         size = [params.context_points, 0, params.target_points]
 
         dls = DataLoaders(
-            datasetCls=Dataset_Custom,
+            datasetCls=Dataset_HomeKitWearable,
             dataset_kwargs={
                 'root_path': root_path,
-                'data_path': 'InfectionStatusAddedTrial.csv',
+                'data_path': ['WearableTrain.csv', 'WearableEval.csv', 'WearableTest.csv'],
                 'features': params.features,
                 'scale': True,
                 'size': size,
@@ -298,6 +298,45 @@ def get_dls(params):
             batch_size=params.batch_size,
             workers=params.num_workers,
         )
+    """
+    elif params.dset == 'wearable':
+
+    root_path = './Homekit2020/data/processed/'
+    size = [params.context_points, 0, params.target_points]
+
+    dls = DataLoaders(
+        datasetCls=Dataset_Custom,
+        dataset_kwargs={
+            'root_path': root_path,
+            'data_path': 'wearable_train.csv',
+            'features': params.features,
+            'scale': True,
+            'size': size,
+            'use_time_features': params.use_time_features
+        },
+
+        valid_dataset_kwargs={
+            'root_path': root_path,
+            'data_path': 'wearable_eval.csv',
+            'features': params.features,
+            'scale': True,
+            'size': size,
+            'use_time_features': params.use_time_features
+        },
+
+        test_dataset_kwargs={
+            'root_path': root_path,
+            'data_path': 'wearable_test.csv',
+            'features': params.features,
+            'scale': True,
+            'size': size,
+            'use_time_features': params.use_time_features
+        },
+
+        batch_size=params.batch_size,
+        workers=params.num_workers,
+    )
+    """
 
     # --------------------------------------------------------------
     # At this point, `dls` has been created for the requested dataset.

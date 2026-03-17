@@ -4,7 +4,9 @@ import pandas as pd
 import pyarrow.dataset as ds
 
 input_root = "./Homekit2020/data/processed/split_2020_02_10_by_user/test"
-output_csv = "./Homekit2020/data/processed/InfectionStatusAddedTrial.csv"
+#output_csv = "./Homekit2020/data/processed/InfectionStatusAddedTrial.csv"
+
+output_csv = "./Homekit2020/data/processed/WearableTrain.csv"
 
 output_csvReal = "./Homekit2020/data/processed/InfectionStatusAddedFullDataset.csv"
 

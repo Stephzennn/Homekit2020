@@ -97,6 +97,7 @@ def find_lr():
     cbs += [PatchCB(patch_len=args.patch_len, stride=args.stride)]
     # define learner
     learn = Learner(dls, model, loss_func, cbs=cbs)                        
+    
     # fit the data to the model
     return learn.lr_finder()
 
