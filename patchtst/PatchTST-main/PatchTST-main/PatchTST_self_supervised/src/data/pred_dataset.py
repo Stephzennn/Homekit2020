@@ -572,7 +572,166 @@ class Dataset_Custom(Dataset):
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
     
+class Dataset_HomeKitWearableV2(Dataset):
+    def __init__(
+        self,
+        root_path,
+        split='train',
+        size=None,
+        features='M',
+        data_path=['WearableTrain.csv', 'WearableEval.csv', 'WearableTest.csv'],
+        target='InfectionStatus',
+        scale=True,
+        timeenc=0,
+        freq='h',
+        time_col_name='date',
+        use_time_features=False,
+        train_split=0.7,
+        test_split=0.2,
+        window_stride=60
+    ):
+        if size is None:
+            self.seq_len = 24 * 4 * 4
+            self.label_len = 24 * 4
+            self.pred_len = 24 * 4
+        else:
+            self.seq_len = size[0]
+            self.label_len = size[1]
+            self.pred_len = size[2]
 
+        assert split in ['train', 'val', 'test']
+        type_map = {'train': 0, 'val': 1, 'test': 2}
+        self.set_type = type_map[split]
+
+        self.features = features
+        self.target = target
+        self.scale = scale
+        self.timeenc = timeenc
+        self.freq = freq
+        self.time_col_name = time_col_name
+        self.use_time_features = use_time_features
+        self.window_stride = window_stride
+
+        # Kept for compatibility, even though pre-split files make these unnecessary
+        self.train_split = train_split
+        self.test_split = test_split
+
+        self.root_path = root_path
+        self.data_path_train = data_path[0]
+        self.data_path_eval = data_path[1]
+        self.data_path_test = data_path[2]
+
+        self.__read_data__()
+
+    def __read_data__(self):
+        self.scaler = StandardScaler()
+
+        # ----------------------------------------------------------
+        # Read the already-separated train / eval / test CSV files
+        # ----------------------------------------------------------
+        df_rawTrain = pd.read_csv(os.path.join(self.root_path, self.data_path_train))
+        df_rawEval = pd.read_csv(os.path.join(self.root_path, self.data_path_eval))
+        df_rawTest = pd.read_csv(os.path.join(self.root_path, self.data_path_test))
+
+        # ----------------------------------------------------------
+        # Select the dataframe for the current split
+        # ----------------------------------------------------------
+        if self.set_type == 0:
+            df_raw = df_rawTrain
+        elif self.set_type == 1:
+            df_raw = df_rawEval
+        else:
+            df_raw = df_rawTest
+
+        # ----------------------------------------------------------
+        # Explicit feature columns for the wearable dataset
+        # Excludes the time column and the target column
+        # ----------------------------------------------------------
+        feature_cols = [
+            'steps',
+            'heart_rate',
+            'missing_heartrate',
+            'missing_steps',
+            'sleep_classic_0',
+            'sleep_classic_1',
+            'sleep_classic_2',
+            'sleep_classic_3'
+        ]
+
+        # ----------------------------------------------------------
+        # Build feature matrix for the current split
+        # and training feature matrix for scaler fitting
+        # ----------------------------------------------------------
+        if self.features in ['M', 'MS']:
+            df_data = df_raw[feature_cols]
+            df_train_data = df_rawTrain[feature_cols]
+        elif self.features == 'S':
+            df_data = df_raw[[self.target]]
+            df_train_data = df_rawTrain[[self.target]]
+        else:
+            raise ValueError(f"Unsupported features setting: {self.features}")
+
+        # ----------------------------------------------------------
+        # Fit scaler on TRAIN ONLY, then transform current split
+        # ----------------------------------------------------------
+        if self.scale:
+            self.scaler.fit(df_train_data.values)
+            data = self.scaler.transform(df_data.values)
+        else:
+            data = df_data.values
+
+        # ----------------------------------------------------------
+        # Build time features for the current split only
+        # ----------------------------------------------------------
+        df_stamp = df_raw[[self.time_col_name]].copy()
+        df_stamp[self.time_col_name] = pd.to_datetime(df_stamp[self.time_col_name])
+
+        if self.timeenc == 0:
+            df_stamp['month'] = df_stamp[self.time_col_name].apply(lambda x: x.month)
+            df_stamp['day'] = df_stamp[self.time_col_name].apply(lambda x: x.day)
+            df_stamp['weekday'] = df_stamp[self.time_col_name].apply(lambda x: x.weekday())
+            df_stamp['hour'] = df_stamp[self.time_col_name].apply(lambda x: x.hour)
+            df_stamp['minute'] = df_stamp[self.time_col_name].apply(lambda x: x.minute)
+            data_stamp = df_stamp.drop([self.time_col_name], axis=1).values
+        elif self.timeenc == 1:
+            data_stamp = time_features(
+                pd.to_datetime(df_stamp[self.time_col_name].values),
+                freq=self.freq
+            )
+            data_stamp = data_stamp.transpose(1, 0)
+        else:
+            raise ValueError(f"Unsupported timeenc setting: {self.timeenc}")
+
+        # ----------------------------------------------------------
+        # Keep PatchTST-style behavior for now:
+        # input and target both come from the same data matrix
+        # ----------------------------------------------------------
+        self.data_x = data
+        self.data_y = data
+        self.data_stamp = data_stamp
+
+    def __getitem__(self, index):
+        s_begin = index * self.window_stride
+        s_end = s_begin + self.seq_len
+        r_begin = s_end - self.label_len
+        r_end = r_begin + self.label_len + self.pred_len
+
+        seq_x = self.data_x[s_begin:s_end]
+        seq_y = self.data_y[r_begin:r_end]
+        seq_x_mark = self.data_stamp[s_begin:s_end]
+        seq_y_mark = self.data_stamp[r_begin:r_end]
+
+        if self.use_time_features:
+            return _torch(seq_x, seq_y, seq_x_mark, seq_y_mark)
+        else:
+            return _torch(seq_x, seq_y)
+
+    def __len__(self):
+        total = len(self.data_x) - self.seq_len - self.pred_len + 1
+        return max(0, (total + self.window_stride - 1) // self.window_stride)
+
+    def inverse_transform(self, data):
+        return self.scaler.inverse_transform(data)
     
 class Dataset_HomeKitWearable(Dataset):
     def __init__(

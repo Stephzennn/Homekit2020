@@ -64,10 +64,15 @@ class PatchMaskCB(Callback):
         preds:   [bs x num_patch x n_vars x patch_len]
         targets: [bs x num_patch x n_vars x patch_len] 
         """
+        target = target.to(preds.device, non_blocking=True)
         loss = (preds - target) ** 2
         loss = loss.mean(dim=-1)
-        loss = (loss * self.mask).sum() / self.mask.sum()
+        mask = self.mask.to(preds.device, non_blocking=True)
+        #loss = (loss * self.mask).sum() / self.mask.sum()
+        loss = (loss * mask).sum() / mask.sum()
         return loss
+
+    
 
 
 def create_patch(xb, patch_len, stride):

@@ -86,37 +86,47 @@ class Learner(GetAttr):
 
     def fit(self, n_epochs, lr=None, cbs=None, do_valid=True):
         " fit the model "
+        #print("Inside Fit")
         self.n_epochs = n_epochs
         if not self.dls.valid: do_valid = False
         if cbs: self.add_callbacks(cbs)
         if lr: self.opt = self.opt_func(self.model.parameters(), lr) 
-
+        #print("Inside fit 2")
         self('before_fit')
         try:
-            for self.epoch in range(n_epochs):            
+            for self.epoch in range(n_epochs): 
+                print("This is the epoch count = ", self.epoch)           
                 self('before_epoch')                     
                 self.one_epoch(train=True)            
                 # if self.dls.valid:                    
                 if do_valid: self.one_epoch(train=False)                
                 self('after_epoch')        
+            #print("print first try")
         except KeyboardInterrupt: pass 
+        #print("print second try")
         self('after_fit')
 
 
     def fit_one_cycle(self, n_epochs, lr_max=None, pct_start=0.3):
+        #print("In fit one cycle")
         self.n_epochs = n_epochs        
         self.lr_max = lr_max if lr_max else self.lr
         cb = OneCycleLR(lr_max=self.lr_max, pct_start=pct_start)
+        #print("About to fit")
+        #print("Epochs", self.n_epochs)
         self.fit(self.n_epochs, cbs=cb)                
          
          
-    def one_epoch(self, train):                           
+    def one_epoch(self, train):       
+        #print("Inside one epoch")                    
         self.epoch_train() if train else self.epoch_validate()        
 
     def epoch_train(self):
         self('before_epoch_train')
+        #print("we are inside epoch train")
         self.model.train()                
         self.dl = self.dls.train
+        #print("adterself.dl")
         self.all_batches('train')
         self('after_epoch_train')
     
@@ -131,13 +141,19 @@ class Learner(GetAttr):
 
 
     def all_batches(self, type_):
-        # for self.num,self.batch in enumerate(progress_bar(dl, leave=False)):        
-        for num, batch in enumerate(self.dl):            
+        # for self.num,self.batch in enumerate(progress_bar(dl, leave=False)):
+        total_batches = len(self.dl)
+        print("total batches:", total_batches)        
+        for num, batch in enumerate(self.dl): 
+            if num % 500 == 0:
+                print("number of batch =", num)
+            #print(" number of batch =", num)           
             self.iter, self.batch = num, batch            
             if type_ == 'train': self.batch_train()
             elif type_ == 'valid': self.batch_validate()
             elif type_ == 'predict': self.batch_predict()             
             elif type_ == 'test': self.batch_test()
+            
 
     def batch_train(self):
         self('before_batch_train')
@@ -159,23 +175,28 @@ class Learner(GetAttr):
         self._do_batch_test()
         self('after_batch_test') 
         
-    def _do_batch_train(self):        
+    def _do_batch_train(self):  
+        #print("inside do batch train")      
         # forward + get loss + backward + optimize          
         self.pred, self.loss = self.train_step(self.batch)                                      
         # zero the parameter gradients
         self.opt.zero_grad()                 
         # gradient
         self.loss.backward()
+        #print("After backwards pass")
         # update weights
         self.opt.step() 
+        #print("After updated weights")
 
     def train_step(self, batch):
         # get the inputs
         self.xb, self.yb = batch
         # forward
+        #print("Forward pass")
         pred = self.model_forward()
         # compute loss
         loss = self.loss_func(pred, self.yb)
+        #print("Loss is ", loss)
         return pred, loss
 
     def model_forward(self):
