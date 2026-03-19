@@ -286,7 +286,7 @@ def get_dls(params):
         size = [params.context_points, 0, params.target_points]
 
         dls = DataLoaders(
-            datasetCls=Dataset_HomeKitWearableV2,
+            datasetCls=Dataset_HomeKitWearableV3,
             dataset_kwargs={
                 'root_path': root_path,
                 'data_path': ['WearableTrain.csv', 'WearableEval.csv', 'WearableTest.csv'],

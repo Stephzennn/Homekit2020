@@ -3,6 +3,7 @@ import pandas as pd
 import os
 import torch
 from torch import nn
+from sklearn.metrics import roc_auc_score, average_precision_score, precision_score
 
 from src.models.patchTST import PatchTST
 from src.learner import Learner, transfer_weights
@@ -29,7 +30,7 @@ parser.add_argument('--is_linear_probe', type=int, default=0, help='if linear_pr
 
 parser.add_argument('--dset_finetune', type=str, default='etth1', help='dataset name')
 parser.add_argument('--context_points', type=int, default=512, help='sequence length')
-parser.add_argument('--target_points', type=int, default=96, help='forecast horizon')
+parser.add_argument('--target_points', type=int, default=1, help='number of output classes/logits; use 1 for binary classification')
 parser.add_argument('--batch_size', type=int, default=64, help='batch size')
 parser.add_argument('--num_workers', type=int, default=0, help='number of workers for DataLoader')
 parser.add_argument('--scaler', type=str, default='standard', help='scale the input data')
@@ -153,9 +154,11 @@ def find_lr(head_type):
     model = get_model(dls.vars, args, head_type)
     model = transfer_weights(args.pretrained_model, model)
 
-    loss_func = torch.nn.MSELoss(reduction='mean')
+    loss_func = torch.nn.BCEWithLogitsLoss()
 
-    cbs = [RevInCB(dls.vars)] if args.revin else []
+    #cbs = [RevInCB(dls.vars)] if args.revin else []
+    
+    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
     cbs += [PatchCB(patch_len=args.patch_len, stride=args.stride)]
 
     learn = Learner(
@@ -192,12 +195,14 @@ def finetune_func(lr=args.lr):
         print('end-to-end finetuning')
 
     dls = get_dls(args)
-    model = get_model(dls.vars, args, head_type='prediction')
+    model = get_model(dls.vars, args, head_type='classification')
     model = transfer_weights(args.pretrained_model, model)
 
-    loss_func = torch.nn.MSELoss(reduction='mean')
+    loss_func = torch.nn.BCEWithLogitsLoss()
 
-    cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
+    #cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
+    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
+    
     cbs += [
         PatchCB(patch_len=args.patch_len, stride=args.stride),
         SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
@@ -209,7 +214,7 @@ def finetune_func(lr=args.lr):
         loss_func,
         lr=lr,
         cbs=cbs,
-        metrics=[mse]
+        metrics=[]
     )
 
     if is_distributed:
@@ -220,7 +225,6 @@ def finetune_func(lr=args.lr):
     else:
         learn.fine_tune(n_epochs=args.n_epochs_finetune, base_lr=lr, freeze_epochs=2)
 
-    #learn.fine_tune(n_epochs=args.n_epochs_finetune, base_lr=lr, freeze_epochs=2)
     save_recorders(learn)
 
 
@@ -229,12 +233,14 @@ def linear_probe_func(lr=args.lr):
         print('linear probing')
 
     dls = get_dls(args)
-    model = get_model(dls.vars, args, head_type='prediction')
+    model = get_model(dls.vars, args, head_type='classification')
     model = transfer_weights(args.pretrained_model, model)
 
-    loss_func = torch.nn.MSELoss(reduction='mean')
+    loss_func = torch.nn.BCEWithLogitsLoss()
 
     cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
+    
+    #cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
     cbs += [
         PatchCB(patch_len=args.patch_len, stride=args.stride),
         SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
@@ -246,7 +252,7 @@ def linear_probe_func(lr=args.lr):
         loss_func,
         lr=lr,
         cbs=cbs,
-        metrics=[mse]
+        metrics=[]
     )
 
     if is_distributed:
@@ -260,27 +266,47 @@ def test_func(weight_path):
     dls = get_dls(args)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = get_model(dls.vars, args, head_type='prediction').to(device)
+    model = get_model(dls.vars, args, head_type='classification').to(device)
 
-    cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
+    #cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
+    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
     cbs += [PatchCB(patch_len=args.patch_len, stride=args.stride)]
 
     learn = Learner(dls, model, cbs=cbs)
 
-    out = learn.test(dls.test, weight_path=weight_path + '.pth', scores=[mse, mae])
+    preds, targets = learn.test(dls.test, weight_path=weight_path + '.pth')
 
-    print('score:', out[2])
+    preds = np.array(preds)
+    targets = np.array(targets)
+
+    probs = 1 / (1 + np.exp(-preds.reshape(-1)))
+    y_true = targets.reshape(-1)
+
+    y_pred = (probs >= 0.5).astype(int)
+
+    if len(np.unique(y_true)) >= 2:
+        roc_auc = roc_auc_score(y_true, probs)
+        pr_auc = average_precision_score(y_true, probs)
+    else:
+        roc_auc = np.nan
+        pr_auc = np.nan
+
+    precision = precision_score(y_true, y_pred, zero_division=0)
+
+    scores = [roc_auc, pr_auc, precision]
+
+    print('score:', scores)
 
     pd.DataFrame(
-        np.array(out[2]).reshape(1, -1),
-        columns=['mse', 'mae']
+        np.array(scores).reshape(1, -1),
+        columns=['roc_auc', 'pr_auc', 'precision']
     ).to_csv(
         args.save_path + args.save_finetuned_model + '_acc.csv',
         float_format='%.6f',
         index=False
     )
 
-    return out
+    return preds, targets, scores
 
 
 if __name__ == '__main__':
@@ -294,7 +320,7 @@ if __name__ == '__main__':
                 print("About to start finetuning")
             finetune_func(args.lr)
         else:
-            suggested_lr = find_lr(head_type='prediction')
+            suggested_lr = find_lr(head_type='classification')
             finetune_func(suggested_lr)
 
         if rank == 0:
@@ -311,7 +337,7 @@ if __name__ == '__main__':
                 print("About to start linear probing")
             linear_probe_func(args.lr)
         else:
-            suggested_lr = find_lr(head_type='prediction')
+            suggested_lr = find_lr(head_type='classification')
             linear_probe_func(suggested_lr)
 
         if rank == 0:
