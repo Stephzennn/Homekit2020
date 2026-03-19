@@ -1030,7 +1030,180 @@ class Dataset_HomeKitWearableV3(Dataset):
 
     def inverse_transform(self, data):
         return self.scaler.inverse_transform(data)
-    
+
+import os
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset
+import pyarrow.dataset as ds
+
+from src.models.lablers import FluPosLabler
+
+
+
+class Dataset_HomeKitParquetClassification(Dataset):
+    def __init__(
+        self,
+        root_path,
+        split='train',
+        data_path=None,
+        scale=False,
+        scaler_stats=None,
+        window_onset_min=0,
+        window_onset_max=0,
+        columns=None,
+    ):
+        """
+        Parquet-window classification dataset for Homekit-style 7-day windows.
+
+        Expected parquet row fields include:
+            participant_id, start, end,
+            steps, heart_rate, missing_heart_rate, missing_steps,
+            sleep_classic_0, sleep_classic_1, sleep_classic_2, sleep_classic_3
+
+        Parameters
+        ----------
+        root_path : str
+            Base directory containing parquet dataset folders/files.
+        split : str
+            For bookkeeping only: 'train', 'val', or 'test'.
+        data_path : str
+            Path under root_path to the parquet dataset, e.g. 'train_7_day' or 'eval_7_day'.
+        scale : bool
+            Whether to z-normalize numerical channels per sample.
+        scaler_stats : dict or None
+            Optional global scaling stats, e.g.
+            {
+                "steps": {"mean": ..., "std": ...},
+                "heart_rate": {"mean": ..., "std": ...}
+            }
+            If None and scale=True, falls back to per-window normalization for numeric channels.
+        window_onset_min, window_onset_max : int
+            Passed to FluPosLabler.
+        columns : list[str] or None
+            Feature columns to use. Defaults to the 8 Homekit fields.
+        """
+        assert split in ['train', 'val', 'test']
+        self.split = split
+        self.root_path = root_path
+        self.data_path = data_path
+        self.scale = scale
+        self.scaler_stats = scaler_stats
+
+        self.feature_cols = columns or [
+            'steps',
+            'heart_rate',
+            'missing_heart_rate',
+            'missing_steps',
+            'sleep_classic_0',
+            'sleep_classic_1',
+            'sleep_classic_2',
+            'sleep_classic_3',
+        ]
+
+        self.numeric_cols = {'steps', 'heart_rate'}
+        self.bool_like_cols = {
+            'missing_heart_rate',
+            'missing_steps',
+            'sleep_classic_0',
+            'sleep_classic_1',
+            'sleep_classic_2',
+            'sleep_classic_3',
+        }
+
+        dataset_path = os.path.join(root_path, data_path) if data_path is not None else root_path
+        self.dataset = ds.dataset(dataset_path, format="parquet", partitioning="hive")
+
+        # Materialize only the columns we need plus keys for labeling
+        needed_cols = ['participant_id', 'start', 'end', 'id'] + self.feature_cols
+        table = self.dataset.to_table(columns=needed_cols)
+        self.df = table.to_pandas()
+
+        # Normalize timestamps
+        self.df['start'] = pd.to_datetime(self.df['start'])
+        self.df['end'] = pd.to_datetime(self.df['end'])
+
+        # Labeler from Homekit task code
+        self.labler = FluPosLabler(
+            window_onset_min=window_onset_min,
+            window_onset_max=window_onset_max
+        )
+
+        # Precompute labels once
+        self.labels = self.df.apply(
+            lambda row: self.labler(row['participant_id'], row['start'], row['end']),
+            axis=1
+        ).astype(np.float32).values
+
+    def __len__(self):
+        return len(self.df)
+
+    def _to_float_array(self, seq, col_name):
+        arr = np.asarray(seq)
+
+        if col_name in self.bool_like_cols:
+            arr = arr.astype(np.float32)
+        else:
+            arr = arr.astype(np.float32)
+
+        return arr
+
+    def _scale_numeric(self, x):
+        """
+        x shape: [T, C]
+        Only scales numeric channels (steps, heart_rate).
+        """
+        if not self.scale:
+            return x
+
+        x = x.copy()
+        col_to_idx = {c: i for i, c in enumerate(self.feature_cols)}
+
+        for col in self.numeric_cols:
+            idx = col_to_idx[col]
+            vals = x[:, idx]
+
+            if self.scaler_stats is not None and col in self.scaler_stats:
+                mu = float(self.scaler_stats[col]["mean"])
+                sigma = float(self.scaler_stats[col]["std"])
+            else:
+                mu = float(vals.mean())
+                sigma = float(vals.std())
+
+            if sigma > 0:
+                x[:, idx] = (vals - mu) / sigma
+
+        return x
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        seqs = []
+        expected_len = None
+
+        for col in self.feature_cols:
+            arr = self._to_float_array(row[col], col)
+
+            if expected_len is None:
+                expected_len = len(arr)
+            elif len(arr) != expected_len:
+                raise ValueError(
+                    f"Mismatched sequence length in row {idx}: "
+                    f"{col} has len {len(arr)}, expected {expected_len}"
+                )
+
+            seqs.append(arr)
+
+        # Stack into [T, C] = [10080, 8]
+        x = np.stack(seqs, axis=1).astype(np.float32)
+        x = self._scale_numeric(x)
+
+        y = np.array([self.labels[idx]], dtype=np.float32)
+
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+
 class Dataset_Pred(Dataset):
     def __init__(self, root_path, split='pred', size=None,
                  features='S', data_path='ETTh1.csv',

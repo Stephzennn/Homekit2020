@@ -279,7 +279,41 @@ def get_dls(params):
             batch_size=params.batch_size,
             workers=params.num_workers,
         )
-        
+    
+    
+    elif params.dset == 'Wearable':
+        root_path = './Homekit2020/data/processed/split_2020_02_10_by_user/'
+        dls = DataLoaders(
+            datasetCls=Dataset_HomeKitParquetClassification,
+            dataset_kwargs={
+                'root_path': root_path,
+                'data_path': 'train_7_day',
+                'split': 'train',
+                'scale': False,
+                'window_onset_min': 0,
+                'window_onset_max': 0,
+            },
+            valid_dataset_kwargs={
+                'root_path': root_path,
+                'data_path': 'eval_7_day',
+                'split': 'val',
+                'scale': False,
+                'window_onset_min': 0,
+                'window_onset_max': 0,
+            },
+            test_dataset_kwargs={
+                'root_path': root_path,
+                'data_path': 'test_7_day',
+                'split': 'test',
+                'scale': False,
+                'window_onset_min': 0,
+                'window_onset_max': 0,
+            },
+            batch_size=params.batch_size,
+            workers=params.num_workers,
+        )    
+    
+    """
     #Custom Dataset 
     elif params.dset == 'Wearable':
         root_path = './Homekit2020/data/processed/'
@@ -298,44 +332,49 @@ def get_dls(params):
             batch_size=params.batch_size,
             workers=params.num_workers,
         )
+        
     """
-    elif params.dset == 'wearable':
+    
+        
+    
+    
+    """
+    elif params.dset == 'Wearable':
+        root_path = './Homekit2020/data/processed/'
+        size = [params.context_points, 0, params.target_points]
 
-    root_path = './Homekit2020/data/processed/'
-    size = [params.context_points, 0, params.target_points]
+        dls = DataLoaders(
+            datasetCls=Dataset_Custom,
+            dataset_kwargs={
+                'root_path': root_path,
+                'data_path': 'wearable_train.csv',
+                'features': params.features,
+                'scale': True,
+                'size': size,
+                'use_time_features': params.use_time_features
+            },
 
-    dls = DataLoaders(
-        datasetCls=Dataset_Custom,
-        dataset_kwargs={
-            'root_path': root_path,
-            'data_path': 'wearable_train.csv',
-            'features': params.features,
-            'scale': True,
-            'size': size,
-            'use_time_features': params.use_time_features
-        },
+            valid_dataset_kwargs={
+                'root_path': root_path,
+                'data_path': 'wearable_eval.csv',
+                'features': params.features,
+                'scale': True,
+                'size': size,
+                'use_time_features': params.use_time_features
+            },
 
-        valid_dataset_kwargs={
-            'root_path': root_path,
-            'data_path': 'wearable_eval.csv',
-            'features': params.features,
-            'scale': True,
-            'size': size,
-            'use_time_features': params.use_time_features
-        },
+            test_dataset_kwargs={
+                'root_path': root_path,
+                'data_path': 'wearable_test.csv',
+                'features': params.features,
+                'scale': True,
+                'size': size,
+                'use_time_features': params.use_time_features
+            },
 
-        test_dataset_kwargs={
-            'root_path': root_path,
-            'data_path': 'wearable_test.csv',
-            'features': params.features,
-            'scale': True,
-            'size': size,
-            'use_time_features': params.use_time_features
-        },
-
-        batch_size=params.batch_size,
-        workers=params.num_workers,
-    )
+            batch_size=params.batch_size,
+            workers=params.num_workers,
+        )
     """
 
     # --------------------------------------------------------------
@@ -354,13 +393,20 @@ def get_dls(params):
     # --------------------------------------------------------------
 
     # Number of input variables / channels
-    dls.vars = dls.train.dataset[0][0].shape[1]
+    #dls.vars = dls.train.dataset[0][0].shape[1]
 
     # Save the context window length directly from params
-    dls.len = params.context_points
+    #dls.len = params.context_points
+    #dls.len = dls.train.dataset[0][0].shape[0]
 
     # Save target dimensionality
-    dls.c = dls.train.dataset[0][1].shape[0]
+    #dls.c = dls.train.dataset[0][1].shape[0]
+    
+    sample_x, sample_y = dls.train.dataset[0]
+
+    dls.vars = sample_x.shape[1]
+    dls.len = sample_x.shape[0]
+    dls.c = sample_y.shape[0]
 
     return dls
 
@@ -382,14 +428,13 @@ if __name__ == "__main__":
 
     # Model Params
     class Params:
-        dset = 'Wearable'          # dataset name
-        context_points = 720       # input sequence length
-        target_points = 48         # forecast horizon
-        batch_size = 32            # batch size
-        num_workers = 8            # dataloader workers
-        with_ray = False           # appears unused here, likely for other workflows
-        features = 'M'             # multivariate mode
-
+        dset = 'Wearable'
+        context_points = 10080
+        target_points = 1
+        batch_size = 32
+        num_workers = 8
+        with_ray = False
+        features = 'M'
     # --------------------------------------------------------------
     # IMPORTANT:
     # Here the original code uses:
