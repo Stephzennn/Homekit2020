@@ -132,7 +132,7 @@ def Prepare_Data_for_PatchTSTV2(bypeople, OutputPath):
 def main():
     print(1)
     dataset = ds.dataset(
-        EvalDataset,
+        trainDataset,
         format="parquet",
         partitioning="hive"
     )
@@ -149,26 +149,26 @@ def main():
     
     """
     #Testing
-    table = dataset.to_table(
-        filter=(
-            (ds.field("date") >= "2019-12-15") &
-            (ds.field("date") <= "2019-12-15")
-        )
-    )
-    #table = dataset.to_table()
+    #table = dataset.to_table(
+    #    filter=(
+    #        (ds.field("date") >= "2019-12-15") &
+    #        (ds.field("date") <= "2019-12-15")
+    #    )
+    #)
+    table = dataset.to_table()
     """
     #Final
     table = dataset.to_table(
         filter=(
             (ds.field("date") >= "2019-12-15") &
-            (ds.field("date") <= "2020-06-29")
+            (ds.field("date") <= "2020-06-31")
         )
     )
     """
     print(3)
     bypeople = table.to_pandas()
     print(4)
-    Prepare_Data_for_PatchTSTV2(bypeople, output_csvEval)
+    Prepare_Data_for_PatchTSTV2(bypeople, output_csvTrain)
 
 if __name__ == "__main__":
     main()

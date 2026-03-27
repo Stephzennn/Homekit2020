@@ -8,18 +8,28 @@ from torchmetrics.regression import explained_variance
 import wandb
 import copy
 from wandb.plot.roc_curve import roc_curve
-from wandb.viz import CustomChart
+#from wandb.viz import CustomChart
+
+#from wandb import viz.CustomChart
 from wandb.data_types import Table
 
 import torch
 import scipy
 
 import torchmetrics
-from torchmetrics import (BinnedPrecisionRecallCurve, BinnedAveragePrecision, 
-                          BootStrapper, MetricCollection, Metric, CosineSimilarity,
-                          ExplainedVariance)
+#from torchmetrics import (BinnedPrecisionRecallCurve, BinnedAveragePrecision, 
+#                          BootStrapper, MetricCollection, Metric, CosineSimilarity,
+#                          ExplainedVariance)
+
+from torchmetrics import MetricCollection, Metric, CosineSimilarity, ExplainedVariance
+from torchmetrics.classification import (
+    BinaryPrecisionRecallCurve as BinnedPrecisionRecallCurve,
+    BinaryAveragePrecision as BinnedAveragePrecision,
+)
+from torchmetrics.wrappers import BootStrapper
                           
-from torchmetrics.functional import auc as tm_auc
+from torchmetrics.utilities.compute import auc as tm_auc
+
 from torchmetrics.functional import precision_recall_curve as tm_precision_recall_curve
 from torchmetrics.utilities.data import dim_zero_cat
 
@@ -33,7 +43,15 @@ from sklearn.metrics import (accuracy_score,precision_recall_fscore_support, roc
 
 
 from functools import partial
-from src.utils import check_for_wandb_run
+import sys
+
+
+root = "/home/hice1/ezg6/projects/Homekit2020/src"
+if root not in sys.path:
+    sys.path.insert(0, root)
+    
+#from src.utils import check_for_wandb_run
+from utils import check_for_wandb_run
 
 class Support(Metric):
     def __init__(self,  n_classes: int = 1,

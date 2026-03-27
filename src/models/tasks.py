@@ -25,6 +25,7 @@ the datasets being used and evaluation metrics.
     :class Autoencode:
 
 """
+
 __docformat__ = 'reStructuredText'
 
 from importlib.resources import path
@@ -46,6 +47,14 @@ from petastorm.etl.dataset_metadata import infer_or_load_unischema
 import petastorm.predicates  as peta_pred
 from petastorm.pytorch import DataLoader as PetastormDataLoader
 
+
+import sys
+
+
+root = "/home/hice1/ezg6/projects/Homekit2020/src"
+if root not in sys.path:
+    sys.path.insert(0, root)
+"""
 from src.models.eval import classification_eval, regression_eval
 from src.data.utils import load_processed_table, url_from_path
 from src.utils import get_logger, read_yaml
@@ -55,8 +64,18 @@ from src.models.lablers import (FluPosLabler, ClauseLabler, EvidationILILabler,
 
 from src.data.utils import read_parquet_to_pandas
 
+"""
+from models.transforms import DefaultTransformRow
 
-from src.models.transforms import DefaultTransformRow
+from models.eval import classification_eval, regression_eval
+from data.utils import load_processed_table, url_from_path
+from utils import get_logger, read_yaml
+from models.lablers import (FluPosLabler, ClauseLabler, EvidationILILabler,
+                                DayOfWeekLabler, AudereObeseLabler, DailyFeaturesLabler, FluPosWeakLabler,
+                                CovidLabler, SameParticipantLabler, SequentialLabler, CovidSignalsLabler)
+
+from data.utils import read_parquet_to_pandas
+
 
 logger = get_logger(__name__)
 
@@ -233,7 +252,7 @@ class ActivityTask(Task):
                  append_daily_features: bool = False,
                  daily_features_path: Optional[str] = None,
                  backend: str = "petastorm",
-                 batch_size: int = 800,
+                 batch_size: int = 16,
                  activity_level: str = "minute",
                  row_transform: Optional[Callable] = None):
 
@@ -292,9 +311,52 @@ class ActivityTask(Task):
                 raise ValueError("Must provide at least one of "
                                  "train_path, val_path, or test_path")
 
+            from pathlib import Path
+            import pyarrow.parquet as pq
+            import numpy as np
+            from pyarrow.lib import ListType, StructType as pyStructType
+            from petastorm.unischema import Unischema, UnischemaField, _numpy_and_codec_from_arrow_type
 
-            self.schema = infer_or_load_unischema(ParquetDataset(infer_schema_path,validate_schema=False))
-            numerical_fields = [k for k,v in self.schema.fields.items() if  np.issubdtype(v.numpy_dtype,np.number)]
+            def build_unischema_from_parquet_dir(parquet_dir: str):
+                parquet_dir = Path(parquet_dir)
+
+                # find one parquet file inside the dataset directory
+                parquet_files = sorted(parquet_dir.rglob("*.parquet"))
+                if not parquet_files:
+                    raise FileNotFoundError(f"No parquet files found under {parquet_dir}")
+
+                arrow_schema = pq.read_schema(parquet_files[0])
+
+                unischema_fields = []
+                for column_name in arrow_schema.names:
+                    arrow_field = arrow_schema.field(column_name)
+                    field_type = arrow_field.type
+                    field_shape = ()
+
+                    if isinstance(field_type, ListType):
+                        if isinstance(field_type.value_type, ListType) or isinstance(field_type.value_type, pyStructType):
+                            continue
+                        field_shape = (None,)
+
+                    try:
+                        np_type = _numpy_and_codec_from_arrow_type(field_type)
+                    except ValueError:
+                        # skip unsupported fields, same spirit as Petastorm's omit_unsupported_fields=True
+                        continue
+
+                    unischema_fields.append(
+                        UnischemaField(column_name, np_type, field_shape, None, arrow_field.nullable)
+                    )
+
+                return Unischema("inferred_schema", unischema_fields)
+
+            self.schema = build_unischema_from_parquet_dir(infer_schema_path)
+            numerical_fields = [
+                k for k, v in self.schema.fields.items()
+                if np.issubdtype(v.numpy_dtype, np.number)
+            ]
+            #self.schema = infer_or_load_unischema(ParquetDataset(infer_schema_path)) #,validate_schema=False
+            #numerical_fields = [k for k,v in self.schema.fields.items() if  np.issubdtype(v.numpy_dtype,np.number)]
 
             # Try to infer the shape of the data 
             # TODO: Really, really don't like how many guesses we make here. There
@@ -327,9 +389,32 @@ class ActivityTask(Task):
                 logger.warning(f"Could not infer data shape from schema, assuming ({len(numerical_fields)},)") 
             else:
                 data_length = lengths.pop()
+            from pathlib import Path
+            import pandas as pd
+            import numpy as np
+
+            def infer_sequence_length_from_data(parquet_dir, fields):
+                parquet_dir = Path(parquet_dir)
+                sample_file = sorted(parquet_dir.rglob("*.parquet"))[0]
+                df = pd.read_parquet(sample_file)
+
+                lengths = set()
+                for f in fields:
+                    value = df.iloc[0][f]
+                    if hasattr(value, "__len__") and not isinstance(value, (str, bytes)):
+                        lengths.add(len(value))
+
+                if not lengths:
+                    raise ValueError("Could not infer sequence length from actual data")
+                if len(lengths) > 1:
+                    raise ValueError(f"Inconsistent lengths across fields: {lengths}")
+
+                return lengths.pop()
+
+            data_length = infer_sequence_length_from_data(infer_schema_path, self.fields)
+            self.data_shape = (data_length, len(self.fields))
 
             self.data_shape = (int(data_length),len(self.fields))
-
         elif backend == "dynamic":
             self.data_shape = shape
 
@@ -439,18 +524,24 @@ class PredictFluPos(ActivityTask):
        given a rolling window of minute level activity data.
        We validate on data after split_date, but before
        max_date, if provided"""
+    
     is_classification = True
+    
     def __init__(self, fields: List[str] = DEFAULT_FIELDS, activity_level: str = "minute",
                  window_onset_max: int = 0, window_onset_min:int = 0,
                  **kwargs):
 
-        self.is_classification = True
+        
         self.labler = FluPosLabler(window_onset_max=window_onset_max,
                                    window_onset_min=window_onset_min)
 
-        ActivityTask.__init__(self, fields=fields, activity_level=activity_level,**kwargs)
-        # ClassificationMixin.__init__(self)
+        #print("before ActivityTask:", self.is_classification)
+        ActivityTask.__init__(self, fields=fields, activity_level=activity_level, **kwargs)
+        self.is_classification = True
 
+
+        ClassificationMixin.__init__(self)
+        #print("after ActivityTask:", self.is_classification)
 
     def get_name(self):
         return "PredictFluPos"
@@ -496,14 +587,14 @@ class PredictCovidSignalsPositivity(ActivityTask):
     def get_labler(self):
         return self.labler
 
-
+"""
 class PredictFluPos(ActivityTask):
-    """ Predict whether a participant was positive
+     Predict whether a participant was positive
         given a rolling window of minute level activity data.
 
         Note that this class should be deprecated in favor of the
         PredictPositivity task.
-    """
+    
     is_classification = True
     def __init__(self, fields: List[str] = DEFAULT_FIELDS, activity_level: str = "minute",
                  window_onset_max: int = 0, window_onset_min:int = 0,
@@ -523,7 +614,7 @@ class PredictFluPos(ActivityTask):
     def get_labler(self):
         return self.labler
 
-
+"""
 class PredictFluPosWeak(ActivityTask):
     """ Predict whether a participant was positive
         given a rolling window of minute level activity data.

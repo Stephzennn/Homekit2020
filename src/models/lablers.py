@@ -15,9 +15,16 @@ from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_sc
 from sklearn.preprocessing import StandardScaler
 import sqlite3
 
+import sys
 
-from src.data.utils import load_processed_table
 
+root = "/home/hice1/ezg6/projects/Homekit2020/src"
+if root not in sys.path:
+    sys.path.insert(0, root)
+
+#from src.data.utils import load_processed_table
+
+from data.utils import load_processed_table
 
 def get_dates_around(date,days_minus,days_plus):
     return pd.date_range(date - pd.to_timedelta(days_minus,unit="D"),

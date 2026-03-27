@@ -16,6 +16,7 @@ architecture.
 
 from copy import copy
 
+from transformers import PatchTSTConfig, PatchTSTForPretraining
 from typing import Dict, Tuple,  Union, Any, Optional, List, Callable
 import torch
 import torch.nn as nn
@@ -230,7 +231,388 @@ class TransformerClassifier(ClassificationModel):
 
 
 
+
+from typing import Dict, Union, Optional, Tuple, Any
+
+import torch
+import torch.nn as nn
+import pytorch_lightning as pl
+from torch import Tensor
+
+
+from transformers import (
+    PatchTSTConfig,
+    PatchTSTForPretraining,
+    PatchTSTForClassification,
+)
+
+from src.models.models.bases import ClassificationModel
+from src.utils import get_logger
+
+logger = get_logger(__name__)
+
+
+class PatchTSTPretrainer(pl.LightningModule):
+    """
+    Self-supervised PatchTST pretraining wrapper.
+
+    Purpose
+    -------
+    This class is for masked patch pretraining only.
+    It is intentionally separate from ClassificationModel because:
+    - pretraining does not use class labels
+    - pretraining loss/outputs differ from classification
+    - the batch structure may be different
+
+    Expected batch
+    --------------
+    At minimum:
+        batch["inputs_embeds"] -> tensor of shape [B, T, C]
+
+    Optionally:
+        batch["past_observed_mask"] -> tensor of shape [B, T, C]
+
+    Notes
+    -----
+    Hugging Face PatchTSTForPretraining expects `past_values` as the main input.
+    This wrapper maps your repo's batch naming (`inputs_embeds`) into that API.
+    """
+
+    def __init__(
+        self,
+        input_shape: Tuple[int, int],
+        learning_rate: float = 1e-3,
+        warmup_steps: int = 0,
+        batch_size: int = 800,
+        num_attention_heads: int = 8,
+        num_hidden_layers: int = 3,
+        d_model: int = 128,
+        ffn_dim: int = 256,
+        dropout: float = 0.1,
+        patch_length: int = 16,
+        patch_stride: int = 16,
+        random_mask_ratio: float = 0.5,
+        channel_attention: bool = False,
+        pretrained_ckpt_path: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__()
+
+        n_timesteps, input_features = input_shape
+        self.name = "PatchTSTPretrainer"
+
+        self.learning_rate = learning_rate
+        self.warmup_steps = warmup_steps
+        self.batch_size = batch_size
+
+        self.train_losses = []
+        self.val_losses = []
+        self.test_losses = []
+
+        self.config = PatchTSTConfig(
+            num_input_channels=input_features,
+            context_length=n_timesteps,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            d_model=d_model,
+            ffn_dim=ffn_dim,
+            dropout=dropout,
+            patch_length=patch_length,
+            patch_stride=patch_stride,
+            do_mask_input=True,
+            mask_type="random",
+            random_mask_ratio=random_mask_ratio,
+            channel_attention=channel_attention,
+        )
+
+        self.model = PatchTSTForPretraining(self.config)
+
+        if pretrained_ckpt_path:
+            ckpt = torch.load(pretrained_ckpt_path, map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt)
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            logger.info(f"Loaded pretraining checkpoint. Missing: {missing}, Unexpected: {unexpected}")
+
+        self.save_hyperparameters()
+
+    @staticmethod
+    def add_model_specific_args(parser):
+        parser.add_argument("--learning_rate", type=float, default=1e-3)
+        parser.add_argument("--warmup_steps", type=int, default=0)
+        parser.add_argument("--batch_size", type=int, default=800)
+        parser.add_argument("--num_attention_heads", type=int, default=8)
+        parser.add_argument("--num_hidden_layers", type=int, default=3)
+        parser.add_argument("--d_model", type=int, default=128)
+        parser.add_argument("--ffn_dim", type=int, default=256)
+        parser.add_argument("--dropout", type=float, default=0.1)
+        parser.add_argument("--patch_length", type=int, default=16)
+        parser.add_argument("--patch_stride", type=int, default=16)
+        parser.add_argument("--random_mask_ratio", type=float, default=0.5)
+        return parser
+
+    def forward(self, inputs_embeds, past_observed_mask=None):
+        """
+        Returns
+        -------
+        loss, outputs
+
+        `outputs` is the full Hugging Face output object, which may contain
+        reconstruction-related tensors depending on model/version/config.
+        """
+        outputs = self.model(
+            past_values=inputs_embeds,
+            past_observed_mask=past_observed_mask,
+        )
+        return outputs.loss, outputs
+
+    def training_step(
+        self, batch, batch_idx
+    ) -> Union[int, Dict[str, Union[Tensor, Dict[str, Tensor]]]]:
+        x = batch["inputs_embeds"].float().to(self.device)
+        observed_mask = batch.get("past_observed_mask", None)
+        if observed_mask is not None:
+            observed_mask = observed_mask.float().to(self.device)
+
+        loss, outputs = self.forward(x, observed_mask)
+
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.train_losses.append(loss.detach().cpu())
+
+        return {"loss": loss}
+
+    def validation_step(
+        self, batch, batch_idx
+    ) -> Union[int, Dict[str, Union[Tensor, Dict[str, Tensor]]]]:
+        x = batch["inputs_embeds"].float().to(self.device)
+        observed_mask = batch.get("past_observed_mask", None)
+        if observed_mask is not None:
+            observed_mask = observed_mask.float().to(self.device)
+
+        loss, outputs = self.forward(x, observed_mask)
+
+        self.log("val/loss", loss, on_step=True, on_epoch=True, sync_dist=True, prog_bar=True)
+        self.val_losses.append(loss.detach().cpu())
+
+        return {"loss": loss}
+
+    def test_step(
+        self, batch, batch_idx
+    ) -> Union[int, Dict[str, Union[Tensor, Dict[str, Tensor]]]]:
+        x = batch["inputs_embeds"].float().to(self.device)
+        observed_mask = batch.get("past_observed_mask", None)
+        if observed_mask is not None:
+            observed_mask = observed_mask.float().to(self.device)
+
+        loss, outputs = self.forward(x, observed_mask)
+
+        self.log("test/loss", loss, on_step=True, on_epoch=True, sync_dist=True)
+        self.test_losses.append(loss.detach().cpu())
+
+        return {"loss": loss}
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+
+        def scheduler(step):
+            return min(1.0, float(step + 1) / max(self.warmup_steps, 1))
+
+        lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, scheduler)
+
+        return [optimizer], [
+            {
+                "scheduler": lr_scheduler,
+                "interval": "step",
+                "frequency": 1,
+                "reduce_on_plateau": False,
+                "monitor": "val/loss",
+            }
+        ]
+
+    def optimizer_step(
+        self,
+        epoch,
+        batch_idx,
+        optimizer,
+        optimizer_idx,
+        optimizer_closure,
+        on_tpu=False,
+        using_native_amp=False,
+        using_lbfgs=False,
+    ):
+        optimizer.step(closure=optimizer_closure)
+
+
+class PatchTSTClassifier(ClassificationModel):
+    """
+    PatchTST classifier wrapper that fits your repo's existing classifier API.
+
+    Purpose
+    -------
+    This class lets you use Hugging Face PatchTSTForClassification while
+    preserving the rest of your codebase's expectations:
+
+        forward(inputs_embeds, labels) -> (loss, preds)
+
+    where:
+    - inputs_embeds is your time-series tensor [B, T, C]
+    - labels is your class target tensor
+    - preds are logits
+
+    This means it should plug into your existing ClassificationModel /
+    SensingModel training, validation, and test machinery.
+    """
+
+    def __init__(
+        self,
+        input_shape: Tuple[int, int],
+        num_attention_heads: int = 8,
+        num_hidden_layers: int = 3,
+        d_model: int = 128,
+        ffn_dim: int = 256,
+        dropout: float = 0.1,
+        patch_length: int = 16,
+        patch_stride: int = 16,
+        num_labels: int = 2,
+        pooling_type: str = "mean",
+        learning_rate: float = 1e-3,
+        warmup_steps: int = 0,
+        batch_size: int = 800,
+        pretrained_ckpt_path: Optional[str] = None,
+        classifier_ckpt_path: Optional[str] = None,
+        **kwargs,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        input_shape:
+            (n_timesteps, input_features)
+
+        pretrained_ckpt_path:
+            Path to a self-supervised pretraining checkpoint. Intended for
+            loading shared backbone weights into the classifier.
+
+        classifier_ckpt_path:
+            Path to a full classification checkpoint. If provided, this
+            attempts to restore the full model directly.
+
+        num_labels:
+            Number of output classes. For binary classification in a
+            CrossEntropy-style setup, use 2.
+        """
+        super().__init__(
+            input_shape=input_shape,
+            learning_rate=learning_rate,
+            warmup_steps=warmup_steps,
+            batch_size=batch_size,
+            **kwargs,
+        )
+
+        self.name = "PatchTSTClassifier"
+        n_timesteps, input_features = input_shape
+
+        self.config = PatchTSTConfig(
+            num_input_channels=input_features,
+            context_length=n_timesteps,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            d_model=d_model,
+            ffn_dim=ffn_dim,
+            dropout=dropout,
+            patch_length=patch_length,
+            patch_stride=patch_stride,
+            num_targets=num_labels,
+            pooling_type=pooling_type,
+        )
+
+        self.model = PatchTSTForClassification(self.config)
+
+        # ------------------------------------------------------------------
+        # Option 1: load a full classifier checkpoint directly.
+        # This is for resuming a fine-tuned classifier.
+        # ------------------------------------------------------------------
+        if classifier_ckpt_path:
+            ckpt = torch.load(classifier_ckpt_path, map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt)
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            logger.info(f"Loaded classifier checkpoint. Missing: {missing}, Unexpected: {unexpected}")
+
+        # ------------------------------------------------------------------
+        # Option 2: initialize classifier from a pretraining checkpoint.
+        # This is for transfer learning:
+        # - encoder/backbone weights should be reused
+        # - classification head may not match and can be skipped
+        #
+        # The exact module names inside Hugging Face can vary by version,
+        # so strict=False is used. You may later want to inspect which
+        # keys loaded cleanly in your environment.
+        # ------------------------------------------------------------------
+        elif pretrained_ckpt_path:
+            ckpt = torch.load(pretrained_ckpt_path, map_location="cpu")
+            state_dict = ckpt.get("state_dict", ckpt)
+            missing, unexpected = self.load_state_dict(state_dict, strict=False)
+            logger.info(f"Loaded pretrained checkpoint into classifier. Missing: {missing}, Unexpected: {unexpected}")
+
+        self.save_hyperparameters()
+
+    @staticmethod
+    def add_model_specific_args(parser):
+        parser.add_argument("--learning_rate", type=float, default=1e-3)
+        parser.add_argument("--warmup_steps", type=int, default=0)
+        parser.add_argument("--batch_size", type=int, default=800)
+        parser.add_argument("--num_attention_heads", type=int, default=8)
+        parser.add_argument("--num_hidden_layers", type=int, default=3)
+        parser.add_argument("--d_model", type=int, default=128)
+        parser.add_argument("--ffn_dim", type=int, default=256)
+        parser.add_argument("--dropout", type=float, default=0.1)
+        parser.add_argument("--patch_length", type=int, default=16)
+        parser.add_argument("--patch_stride", type=int, default=16)
+        parser.add_argument("--num_labels", type=int, default=2)
+        parser.add_argument("--pooling_type", type=str, default="mean")
+        return parser
+
+    def forward(self, inputs_embeds, labels):
+        """
+        Expected input
+        --------------
+        inputs_embeds : Tensor
+            Shape [B, T, C]
+
+        labels : Tensor
+            For CrossEntropy-style classification, shape [B]
+            with integer class indices in [0, num_labels-1].
+
+        Returns
+        -------
+        loss, preds
+            loss  : scalar tensor
+            preds : logits tensor, shape [B, num_labels]
+
+        Why return this way?
+        --------------------
+        Because your base class SensingModel and all the existing classifier
+        infrastructure expect:
+            loss, preds = self.forward(x, y)
+        """
+        labels = labels.long().view(-1)
+
+        outputs = self.model(
+            past_values=inputs_embeds,
+            target_values=labels,
+        )
+
+        # Hugging Face classification output stores logits in
+        # `prediction_logits` for PatchTST classification.
+        preds = outputs.prediction_logits
+        loss = outputs.loss
+
+        return loss, preds
+
+
+
+    
+
 class HIVECOTE2(NonNeuralMixin,ClassificationModel):
+    
     
     def __init__(
         self,
@@ -262,3 +644,4 @@ class XGBoost(xgb.XGBClassifier, NonNeuralMixin,ClassificationModel):
 
     def forward(self, inputs_embeds,labels):
         raise NotImplementedError
+

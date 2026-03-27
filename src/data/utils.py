@@ -16,8 +16,19 @@ import pyarrow as pa
 from torch.utils import data
 import numpy as np
 
-from src.utils import get_logger
-import src.data.constants as constants
+import sys
+
+
+root = "/home/hice1/ezg6/projects/Homekit2020/src"
+if root not in sys.path:
+    sys.path.insert(0, root)
+
+#rom src.utils import get_logger
+#import src.data.constants as constants
+
+
+from utils import get_logger
+import data.constants as constants
 
 import wandb
 from tqdm import tqdm
@@ -30,10 +41,19 @@ config = dotenv_values(".env")
 logger = get_logger(__name__)
 
 DATASET_VERSION="2020-07-15"
-main_path = os.getcwd()
-RAW_DATA_PATH = os.path.join(main_path,"data","raw","audere","data-export",DATASET_VERSION)
-PROCESSED_DATA_PATH = os.path.join(main_path,"data","processed")
-DEBUG_DATA_PATH = os.path.join(main_path,"data","debug")
+
+#main_path = os.getcwd()
+#RAW_DATA_PATH = os.path.join(main_path,"data","raw","audere","data-export",DATASET_VERSION)
+#PROCESSED_DATA_PATH = os.path.join(main_path,"data","processed")
+#DEBUG_DATA_PATH = os.path.join(main_path,"data","debug")
+
+
+from pathlib import Path
+
+main_path = Path(__file__).resolve().parents[2]   # adjust if needed
+RAW_DATA_PATH = main_path / "data" / "raw" / "audere" / "data-export" / DATASET_VERSION
+PROCESSED_DATA_PATH = main_path / "data" / "processed"
+DEBUG_DATA_PATH = main_path / "data" / "debug"
 
 def get_raw_dataset_path(name):
     if name in constants.MTL_NAMES:
@@ -62,7 +82,7 @@ def load_raw_table(name=None,path=None,fmt="df"):
         if not name:
             raise ValueError("Must provided either a known dataset name or a path")
         dataset = find_raw_dataset(name)
-        logger.info(f"Reading {name}...")
+        #logger.info(f"Reading {name}...")
     else:
         dataset = pq.ParquetDataset(path)
     if fmt=="df":
@@ -110,7 +130,7 @@ def load_processed_table(name,fmt="df",path=None):
                 dataset[column] = pd.to_datetime(dataset[column])
             except (ValueError, TypeError, pd.errors.OutOfBoundsDatetime):
                 continue
-    logger.info(f"Reading {name}...")
+    #logger.info(f"Reading {name}...")
     if fmt=="df":
         return dataset
     else:

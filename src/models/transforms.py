@@ -101,6 +101,7 @@ class DefaultTransformRow(RowTransform):
             
         else:
             label = inputs_embeds.astype(np.float32)
+            #label = labler(participant_id,start,end)
 
         if self.task.daily_features_labler:
             day_features = self.task.daily_features_labler(participant_id,start,end)

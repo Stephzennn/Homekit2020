@@ -280,9 +280,30 @@ def get_dls(params):
             workers=params.num_workers,
         )
     
-    
+    #Custom Dataset 
     elif params.dset == 'Wearable':
-        root_path = './Homekit2020/data/processed/split_2020_02_10_by_user/'
+        root_path = './Homekit2020/data/processed/'
+        #root_path = './Homekit2020/data/processed/FullBypeople/'
+        size = [params.context_points, 0, params.target_points]
+
+        dls = DataLoaders(
+            datasetCls=Dataset_HomeKitWearableV3,
+            dataset_kwargs={
+                'root_path': root_path,
+                'data_path': ['WearableTrain.csv', 'WearableEval.csv', 'WearableTest.csv'],
+                'features': params.features,
+                'scale': True,
+                'size': size,
+                'use_time_features': params.use_time_features
+            },
+            batch_size=params.batch_size,
+            workers=params.num_workers,
+        )
+    
+    
+    """
+    elif params.dset == 'Wearable':
+        root_path = './Homekit2020/data/processed/split_2020_02_10_by_user/'  
         dls = DataLoaders(
             datasetCls=Dataset_HomeKitParquetClassification,
             dataset_kwargs={
@@ -314,26 +335,9 @@ def get_dls(params):
         )    
     
     """
-    #Custom Dataset 
-    elif params.dset == 'Wearable':
-        root_path = './Homekit2020/data/processed/'
-        size = [params.context_points, 0, params.target_points]
-
-        dls = DataLoaders(
-            datasetCls=Dataset_HomeKitWearableV3,
-            dataset_kwargs={
-                'root_path': root_path,
-                'data_path': ['WearableTrain.csv', 'WearableEval.csv', 'WearableTest.csv'],
-                'features': params.features,
-                'scale': True,
-                'size': size,
-                'use_time_features': params.use_time_features
-            },
-            batch_size=params.batch_size,
-            workers=params.num_workers,
-        )
+    
         
-    """
+    
     
         
     
@@ -407,7 +411,7 @@ def get_dls(params):
     dls.vars = sample_x.shape[1]
     dls.len = sample_x.shape[0]
     dls.c = sample_y.shape[0]
-
+    print ("Finished DLS")
     return dls
 
 
