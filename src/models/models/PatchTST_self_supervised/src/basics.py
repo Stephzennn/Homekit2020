@@ -5,7 +5,7 @@ import collections
 from collections import OrderedDict
 
 class GetAttr:
-
+    print("Inside GetAttr")
     "Inherit from this to have all attr accesses in `self._xtra` passed down to `self.default`"
     _default='default'
     def _component_attr_filter(self,k):
