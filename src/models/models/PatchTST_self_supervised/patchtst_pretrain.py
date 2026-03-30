@@ -75,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
     # Argument specifying model type for organizing save paths
     parser.add_argument('--model_type', type=str, default='based_model', help='for multivariate model or univariate model')
 
+    # Optional: resume pretraining from a previously saved checkpoint.
+    # If not provided, pretraining starts from scratch (default behaviour unchanged).
+    parser.add_argument('--resume_from', type=str, default=None,
+                        help='path to a pretrained .pth checkpoint to resume from (optional)')
+
     return parser
 
 
@@ -216,6 +221,10 @@ def find_lr(args: argparse.Namespace, rank: int):
     """
     dls = get_dls(args)
     model = get_model(dls.vars, args, rank)
+    if args.resume_from is not None:
+        model = transfer_weights(args.resume_from, model)
+        if rank == 0:
+            print(f"[rank 0] LR finder: resumed weights from {args.resume_from}")
 
     loss_func = torch.nn.MSELoss(reduction='mean')
 
@@ -230,7 +239,7 @@ def find_lr(args: argparse.Namespace, rank: int):
         cbs=cbs,
     )
 
-    suggested_lr = learn.lr_finder()
+    suggested_lr = learn.lr_finder(end_lr=args.lr)
 
     if rank == 0:
         print('suggested_lr', suggested_lr)
@@ -264,6 +273,12 @@ def pretrain_func(
         print(2)
 
     model = get_model(dls.vars, args, rank)
+    if args.resume_from is not None:
+        model = transfer_weights(args.resume_from, model)
+        if rank == 0:
+            n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"[rank 0] Checkpoint loaded successfully from: {args.resume_from}")
+            print(f"[rank 0] Model has {n_params:,} trainable parameters — weights are live and ready to continue training.")
     if rank == 0:
         print(3)
 

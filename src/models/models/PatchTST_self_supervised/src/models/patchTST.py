@@ -34,7 +34,8 @@ class PatchTST(nn.Module):
 
         super().__init__()
 
-        assert head_type in ['pretrain', 'prediction', 'regression', 'classification'], 'head type should be either pretrain, prediction, or regression'
+        assert head_type in ['pretrain', 'prediction', 'regression', 'classification', 'resnet_classification'], \
+            'head type should be one of: pretrain, prediction, regression, classification, resnet_classification'
         # Backbone
         self.backbone = PatchTSTEncoder(c_in, num_patch=num_patch, patch_len=patch_len, 
                                 n_layers=n_layers, d_model=d_model, n_heads=n_heads, 
@@ -55,6 +56,11 @@ class PatchTST(nn.Module):
             self.head = RegressionHead(self.n_vars, d_model, target_dim, head_dropout, y_range)
         elif head_type == "classification":
             self.head = ClassificationHead(self.n_vars, d_model, target_dim, head_dropout)
+        elif head_type == "resnet_classification":
+            # ResNet head uses all patches (not just the last one) via 1D residual conv blocks.
+            # Better at capturing temporal patterns across the full lookback window.
+            from ..models.layers.heads import ResNetClassificationHead
+            self.head = ResNetClassificationHead(self.n_vars, d_model, target_dim, head_dropout)
 
 
     def forward(self, z):                             

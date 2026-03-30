@@ -269,7 +269,13 @@ class SaveModelCB(TrackerCB):
         else:
             super().after_epoch()
             if self.new_best:
-                print(f'Better model found at epoch {self.epoch} with {self.monitor} value: {self.best}.')
+                if self.global_rank == self.save_process_id:
+                    roc_str = ''
+                    if hasattr(self, 'learner') and 'valid_roc_auc' in self.learner.recorder:
+                        roc_vals = self.learner.recorder['valid_roc_auc']
+                        if roc_vals:
+                            roc_str = f', val ROC-AUC: {roc_vals[-1]:.4f}'
+                    print(f'Better model found at epoch {self.epoch} with {self.monitor}: {self.best:.6f}{roc_str}')
                 self._save(f'{self.fname}', self.path)
 
     def after_fit(self):

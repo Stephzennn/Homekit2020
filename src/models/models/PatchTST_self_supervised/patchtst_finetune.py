@@ -55,23 +55,34 @@ class ValidationROCAUCCB(Callback):
         if not self.learner.dls.valid:
             return
 
-        preds = torch.cat(self._preds).numpy()
-        targs = torch.cat(self._targs).numpy()
+        preds = torch.cat(self._preds)  # [N_local] — still a tensor for gathering
+        targs = torch.cat(self._targs)
 
-        # Convert raw logits → probabilities via sigmoid
-        probs = 1 / (1 + np.exp(-preds.reshape(-1)))
-        y_true = targs.reshape(-1)
+        # In DDP: each rank only saw its shard of the validation set.
+        # all_gather_object collects tensors from every rank onto every rank
+        # so all ranks compute ROC-AUC on the full validation set and store
+        # the same value — making SaveModelCB consistent across ranks.
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            world_size = dist.get_world_size()
+            all_preds = [None] * world_size
+            all_targs = [None] * world_size
+            dist.all_gather_object(all_preds, preds)
+            dist.all_gather_object(all_targs, targs)
+            preds = torch.cat(all_preds)
+            targs = torch.cat(all_targs)
+
+        probs = torch.sigmoid(preds).numpy().reshape(-1)
+        y_true = targs.numpy().reshape(-1)
 
         if len(np.unique(y_true)) < 2:
             # Validation split has only one class — ROC-AUC is undefined.
-            # Store 0.0 so the recorder key always has a value this epoch.
             roc_auc = 0.0
         else:
             roc_auc = roc_auc_score(y_true, probs)
 
         self.learner.recorder['valid_roc_auc'].append(roc_auc)
 
-        # Only rank 0 prints to avoid duplicate lines in DDP runs
+        # Only rank 0 prints — all ranks have the same value so one print is enough
         _rank = int(os.environ.get("RANK", 0))
         if _rank == 0:
             print(f"  [val ROC-AUC: {roc_auc:.4f}]")
@@ -104,18 +115,30 @@ parser.add_argument('--d_model', type=int, default=128, help='Transformer d_mode
 parser.add_argument('--d_ff', type=int, default=256, help='Tranformer MLP dimension')
 parser.add_argument('--dropout', type=float, default=0.2, help='Transformer dropout')
 parser.add_argument('--head_dropout', type=float, default=0.2, help='head dropout')
+parser.add_argument('--head_type', type=str, default='classification',
+                    choices=['classification', 'resnet_classification'],
+                    help='classification head architecture: '
+                         '"classification" = linear probe on last patch (default); '
+                         '"resnet_classification" = 1D ResNet over all patches')
 
 parser.add_argument('--n_epochs_finetune', type=int, default=3, help='number of finetuning epochs')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
 
 parser.add_argument('--pretrained_model', type=str, default=None, help='pretrained model name')
+# Optional: path to a linear probe checkpoint to use as starting point for full finetuning.
+# When provided, finetune_func loads this instead of --pretrained_model, giving it a
+# backbone + already-trained classification head. This prevents catastrophic forgetting
+# because the head is stable before the backbone starts receiving gradients.
+# If not provided, finetune_func loads --pretrained_model as before (default behaviour).
+parser.add_argument('--linear_probe_model', type=str, default=None,
+                    help='path to a linear probe checkpoint to warm-start full finetuning (optional)')
 parser.add_argument('--finetuned_model_id', type=int, default=1, help='id of the saved finetuned model')
 parser.add_argument('--model_type', type=str, default='based_model', help='for multivariate model or univariate model')
 # Cap the BCEWithLogitsLoss pos_weight to prevent gradient instability on
 # severely imbalanced datasets. The raw ratio (n_neg/n_pos) can be >2000,
 # which destabilises training. A cap of 50-100 is a safe starting point.
 # Set to -1 to use the raw ratio with no cap.
-parser.add_argument('--pos_weight_cap', type=float, default=100.0,
+parser.add_argument('--pos_weight_cap', type=float, default=-1.0,
                     help='maximum value for BCEWithLogitsLoss pos_weight (caps n_neg/n_pos ratio); -1 = no cap')
 
 
@@ -295,7 +318,7 @@ def find_lr(head_type):
         cbs=cbs,
     )
 
-    suggested_lr = learn.lr_finder()
+    suggested_lr = learn.lr_finder(end_lr=args.lr)
     if rank == 0:
         print('suggested_lr', suggested_lr)
     return suggested_lr
@@ -321,8 +344,19 @@ def finetune_func(lr=args.lr):
         print('end-to-end finetuning')
 
     dls = get_dls(args)
-    model = get_model(dls.vars, args, head_type='classification')
-    model = transfer_weights(args.pretrained_model, model)
+    model = get_model(dls.vars, args, head_type=args.head_type)
+
+    # If a linear probe checkpoint is provided, load it instead of the raw pretrain weights.
+    # The linear probe checkpoint contains both the pretrained backbone AND a trained
+    # classification head — so finetuning starts with a stable head, preventing the
+    # large random-head gradients that cause catastrophic forgetting of pretrained features.
+    # If no linear_probe_model is given, fall back to loading the pretrain weights as before.
+    if args.linear_probe_model is not None:
+        model = transfer_weights(args.linear_probe_model, model)
+        if rank == 0:
+            print(f"[rank 0] Loaded linear probe checkpoint: {args.linear_probe_model}")
+    else:
+        model = transfer_weights(args.pretrained_model, model)
 
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     pos_weight = compute_pos_weight(dls.train.dataset.data["label"], device)
@@ -362,8 +396,8 @@ def finetune_func(lr=args.lr):
         # ValidationROCAUCCB must come before SaveModelCB so it populates
         # recorder['valid_roc_auc'] before SaveModelCB.before_fit asserts it.
         ValidationROCAUCCB(),
-        # SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
-        SaveModelCB(monitor='valid_roc_auc', fname=args.save_finetuned_model, path=args.save_path)
+        SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
+        # SaveModelCB(monitor='valid_roc_auc', fname=args.save_finetuned_model, path=args.save_path)
     ]
 
     learn = Learner(
@@ -391,7 +425,7 @@ def linear_probe_func(lr=args.lr):
         print('linear probing')
 
     dls = get_dls(args)
-    model = get_model(dls.vars, args, head_type='classification')
+    model = get_model(dls.vars, args, head_type=args.head_type)
     model = transfer_weights(args.pretrained_model, model)
 
     # Same weighted BCE as finetune_func — prevents the model from collapsing
@@ -431,8 +465,8 @@ def linear_probe_func(lr=args.lr):
     cbs += [
         PatchCB(patch_len=args.patch_len, stride=args.stride),
         ValidationROCAUCCB(),
-        # SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
-        SaveModelCB(monitor='valid_roc_auc', fname=args.save_finetuned_model, path=args.save_path)
+        SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
+        # SaveModelCB(monitor='valid_roc_auc', fname=args.save_finetuned_model, path=args.save_path)
     ]
 
     learn = Learner(
@@ -458,7 +492,7 @@ def test_func(weight_path):
     print("test  labels:", dls.test.dataset.data["label"].unique(return_counts=True))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = get_model(dls.vars, args, head_type='classification').to(device)
+    model = get_model(dls.vars, args, head_type=args.head_type).to(device)
 
     #cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
     cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
@@ -520,7 +554,7 @@ if __name__ == '__main__':
 
             if rank == 0:
                 print("Running lr_finder on rank 0...")
-                suggested_lr = find_lr(head_type='classification')
+                suggested_lr = find_lr(head_type=args.head_type)
                 suggested_lr = float(suggested_lr)
                 print(f"[rank 0] Suggested LR: {suggested_lr:.6f}. Broadcasting to all ranks...")
                 lr_tensor[0] = suggested_lr
@@ -532,7 +566,7 @@ if __name__ == '__main__':
                 print("About to start finetuning")
             finetune_func(suggested_lr)
         else:
-            suggested_lr = find_lr(head_type='classification')
+            suggested_lr = find_lr(head_type=args.head_type)
             finetune_func(suggested_lr)
 
         if rank == 0:
@@ -550,7 +584,7 @@ if __name__ == '__main__':
 
             if rank == 0:
                 print("Running lr_finder on rank 0...")
-                suggested_lr = find_lr(head_type='classification')
+                suggested_lr = find_lr(head_type=args.head_type)
                 suggested_lr = float(suggested_lr)
                 print(f"[rank 0] Suggested LR: {suggested_lr:.6f}. Broadcasting to all ranks...")
                 lr_tensor[0] = suggested_lr
@@ -562,7 +596,7 @@ if __name__ == '__main__':
                 print("About to start linear probing")
             linear_probe_func(suggested_lr)
         else:
-            suggested_lr = find_lr(head_type='classification')
+            suggested_lr = find_lr(head_type=args.head_type)
             linear_probe_func(suggested_lr)
 
         if rank == 0:
