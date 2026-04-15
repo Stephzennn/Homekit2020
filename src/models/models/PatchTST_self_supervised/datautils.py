@@ -81,6 +81,8 @@ class DataLoadersV2:
         shuffle_train: bool = True,
         shuffle_val: bool = False,
         autoencoder_label: bool = False,
+        splits=('train', 'val', 'test'),
+        label_filter: str = 'all',
     ):
         super().__init__()
 
@@ -95,14 +97,18 @@ class DataLoadersV2:
         self.shuffle_val = shuffle_val
         self.autoencoder_label = autoencoder_label
 
+        if label_filter not in ('all', 'positive', 'negative'):
+            raise ValueError(f"label_filter must be 'all', 'positive', or 'negative'; got '{label_filter}'")
+        self.label_filter = label_filter
+
         if self.datasetCls is None and self.taskCls is None:
             raise ValueError("Provide either datasetCls or taskCls")
         if self.datasetCls is not None and self.taskCls is not None:
             raise ValueError("Provide only one of datasetCls or taskCls")
 
-        self.train = self._make_dloader("train", shuffle=self.shuffle_train)
-        self.valid = self._make_dloader("val", shuffle=self.shuffle_val)
-        self.test = self._make_dloader("test", shuffle=False)
+        self.train = self._make_dloader("train", shuffle=self.shuffle_train) if 'train' in splits else None
+        self.valid = self._make_dloader("val", shuffle=self.shuffle_val) if 'val' in splits else None
+        self.test = self._make_dloader("test", shuffle=False) if 'test' in splits else None
 
     # ------------------------------------------------------------------
     # Public API
@@ -167,6 +173,18 @@ class DataLoadersV2:
         if len(dataset) == 0:
             return None
 
+        # Apply label-based filtering to the train split only.
+        # 'positive' keeps samples with label >= 1; 'negative' keeps label == 0.
+        if split == 'train' and self.label_filter != 'all':
+            dataset = self._filter_by_label(dataset, self.label_filter)
+            if len(dataset) == 0:
+                import warnings
+                warnings.warn(
+                    f"label_filter='{self.label_filter}' removed all training samples. "
+                    "Check that the dataset contains samples with the requested label."
+                )
+                return None
+
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -174,6 +192,70 @@ class DataLoadersV2:
             num_workers=self.workers,
             collate_fn=self.collate_fn,
         )
+
+    # ------------------------------------------------------------------
+    # Label filtering
+    # ------------------------------------------------------------------
+    def _filter_by_label(self, dataset: 'DictDataset', mode: str) -> 'DictDataset':
+        """
+        Return a new DictDataset containing only the samples whose label
+        matches `mode`.
+
+        Parameters
+        ----------
+        dataset : DictDataset
+            Fully materialized dataset with a 'label' key.
+        mode : str
+            'positive' — keep samples where label >= 1 (positive class).
+            'negative' — keep samples where label == 0 (healthy/negative class).
+
+        Returns
+        -------
+        DictDataset
+            Filtered dataset.
+        """
+        if 'label' not in dataset.data:
+            raise KeyError(
+                "label_filter requires a 'label' key in the dataset, but none was found."
+            )
+
+        labels = dataset.data['label']
+
+        # Support both scalar labels (shape [N]) and per-timestep labels.
+        # For scalar tensors we compare directly; for multi-dim we use the
+        # first element (index 0) per sample as the "window label".
+        if torch.is_tensor(labels):
+            flat_labels = labels.view(len(labels), -1)[:, 0]  # shape [N]
+            if mode == 'positive':
+                mask = flat_labels >= 1
+            else:  # 'negative'
+                mask = flat_labels == 0
+            indices = mask.nonzero(as_tuple=False).squeeze(1).tolist()
+        else:
+            # List of scalars / objects
+            if mode == 'positive':
+                indices = [i for i, v in enumerate(labels) if float(v) >= 1]
+            else:
+                indices = [i for i, v in enumerate(labels) if float(v) == 0]
+
+        import os
+        rank = int(os.environ.get("RANK", 0))
+        print(
+            f"[rank {rank}] label_filter='{mode}': "
+            f"{len(indices)} / {len(dataset)} training samples retained.",
+            flush=True,
+        )
+
+        filtered = {}
+        for k, v in dataset.data.items():
+            if torch.is_tensor(v):
+                filtered[k] = v[indices]
+            elif isinstance(v, np.ndarray):
+                filtered[k] = v[indices]
+            else:
+                filtered[k] = [v[i] for i in indices]
+
+        return DictDataset(filtered)
 
     # ------------------------------------------------------------------
     # Task/parquet materialization
@@ -315,7 +397,7 @@ DSETS = [
 ]
 
 
-def get_dls(params):
+def get_dls(params, test_only=False):
     """
     Build and return dataset-backed dataloaders for the dataset specified
     in `params.dset`.
@@ -577,7 +659,7 @@ def get_dls(params):
 
         #from src.models.tasks import PredictFluPos
         
-        from models.tasks import PredictFluPos
+        from models.tasks import PredictFluPos 
         
         
         #root_path = './Homekit2020/data/processed/FullBypeople/'
@@ -592,12 +674,13 @@ def get_dls(params):
                 "window_onset_min": 0,
                 "window_onset_max": 0,
                 #"shape": (10080, 8),
-                
+
             },
-             batch_size =params.batch_size,
-             #Here, change the autoencoder label to False when running 
+             batch_size=params.batch_size,
              autoencoder_label=False,
-             workers=params.num_workers
+             workers=params.num_workers,
+             splits=('test',) if test_only else ('train', 'val', 'test'),
+             label_filter=getattr(params, 'label_filter', 'all'),
         )
 
     # --------------------------------------------------------------
@@ -626,8 +709,9 @@ def get_dls(params):
     #dls.c = dls.train.dataset[0][1].shape[0]
     
     try:
-    # Old dataset-style path
-        sample = dls.train.dataset[0]
+    # Old dataset-style path — use whichever split is available
+        _ref_dl = dls.train or dls.test or dls.valid
+        sample = _ref_dl.dataset[0]
 
         if isinstance(sample, dict):
             sample_x = sample["inputs_embeds"]

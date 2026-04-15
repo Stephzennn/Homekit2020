@@ -3,7 +3,16 @@ import pandas as pd
 import os
 import torch
 import torch.distributed as dist
-from sklearn.metrics import roc_auc_score, average_precision_score, precision_score
+import matplotlib
+matplotlib.use('Agg')  # non-interactive backend — safe for SLURM/headless nodes
+import matplotlib.pyplot as plt
+
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, precision_score,
+    recall_score, f1_score, fbeta_score, matthews_corrcoef,
+    balanced_accuracy_score, confusion_matrix, roc_curve,
+    precision_recall_curve,
+)
 from src.callback.core import Callback
 
 from src.models.patchTST import PatchTST
@@ -35,11 +44,12 @@ class ValidationROCAUCCB(Callback):
     def before_fit(self):
         if self.run_finder:
             return
-        # Add the key to the recorder so SaveModelCB can assert it exists
+        # Add the keys to the recorder so SaveModelCB can assert they exist
         # during its own before_fit. TrackTrainingCB already created the
         # recorder by this point (default cbs run before user cbs).
         if hasattr(self.learner, 'recorder'):
             self.learner.recorder['valid_roc_auc'] = []
+            self.learner.recorder['valid_pr_auc'] = []
 
     def before_epoch_valid(self):
         self._preds = []
@@ -60,7 +70,7 @@ class ValidationROCAUCCB(Callback):
 
         # In DDP: each rank only saw its shard of the validation set.
         # all_gather_object collects tensors from every rank onto every rank
-        # so all ranks compute ROC-AUC on the full validation set and store
+        # so all ranks compute metrics on the full validation set and store
         # the same value — making SaveModelCB consistent across ranks.
         if dist.is_initialized() and dist.get_world_size() > 1:
             world_size = dist.get_world_size()
@@ -75,17 +85,58 @@ class ValidationROCAUCCB(Callback):
         y_true = targs.numpy().reshape(-1)
 
         if len(np.unique(y_true)) < 2:
-            # Validation split has only one class — ROC-AUC is undefined.
+            # Validation split has only one class — metrics are undefined.
             roc_auc = 0.0
+            pr_auc = 0.0
         else:
             roc_auc = roc_auc_score(y_true, probs)
+            pr_auc = average_precision_score(y_true, probs)
 
         self.learner.recorder['valid_roc_auc'].append(roc_auc)
+        self.learner.recorder['valid_pr_auc'].append(pr_auc)
 
         # Only rank 0 prints — all ranks have the same value so one print is enough
         _rank = int(os.environ.get("RANK", 0))
         if _rank == 0:
-            print(f"  [val ROC-AUC: {roc_auc:.4f}]")
+            print(f"  [val ROC-AUC: {roc_auc:.4f}  |  val PR-AUC: {pr_auc:.4f}]")
+
+
+# ------------------------------------------------------------------
+# Generalization-aware save callback
+# Saves the model on best valid_loss, but ONLY while valid_loss <= train_loss.
+# Once the gap inverts (model starts memorising), saving stops.
+# ------------------------------------------------------------------
+class GeneralizationSaveModelCB(SaveModelCB):
+    """
+    Extends SaveModelCB(monitor='valid_loss') with an extra guard:
+    only save when valid_loss <= train_loss.
+
+    This pins the saved checkpoint to the generalization peak —
+    the last epoch where the model is still improving on held-out
+    data without having started to memorise the training set.
+    """
+
+    def after_epoch(self):
+        if self.run_finder:
+            return
+        recorder = self.learner.recorder
+        # Need at least one value for both losses
+        if not recorder.get('train_loss') or not recorder.get('valid_loss'):
+            return
+        train_loss = recorder['train_loss'][-1]
+        valid_loss = recorder['valid_loss'][-1]
+        if valid_loss <= train_loss:
+            # Gap has not inverted — defer to normal SaveModelCB logic
+            super().after_epoch()
+        else:
+            # Overfitting detected: update TrackerCB state without saving
+            # so the epoch counter stays consistent, but skip the file write.
+            _rank = int(os.environ.get("RANK", 0))
+            if _rank == self.save_process_id:
+                print(
+                    f'Epoch {self.epoch}: valid_loss ({valid_loss:.6f}) > '
+                    f'train_loss ({train_loss:.6f}) — skipping save (overfitting guard)'
+                )
 
 
 # ------------------------------------------------------------------
@@ -123,6 +174,8 @@ parser.add_argument('--head_type', type=str, default='classification',
 
 parser.add_argument('--n_epochs_finetune', type=int, default=3, help='number of finetuning epochs')
 parser.add_argument('--lr', type=float, default=1e-4, help='learning rate')
+parser.add_argument('--use_lr_finder', type=int, default=1,
+                    help='run LR finder before training (1=yes, 0=use --lr directly)')
 
 parser.add_argument('--pretrained_model', type=str, default=None, help='pretrained model name')
 # Optional: path to a linear probe checkpoint to use as starting point for full finetuning.
@@ -140,6 +193,10 @@ parser.add_argument('--model_type', type=str, default='based_model', help='for m
 # Set to -1 to use the raw ratio with no cap.
 parser.add_argument('--pos_weight_cap', type=float, default=-1.0,
                     help='maximum value for BCEWithLogitsLoss pos_weight (caps n_neg/n_pos ratio); -1 = no cap')
+
+parser.add_argument('--use_wandb', type=int, default=0, help='enable Weights & Biases logging (1=yes, 0=no)')
+parser.add_argument('--wandb_project', type=str, default='PatchTST-Wearable', help='wandb project name')
+parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name (defaults to model save name)')
 
 
 # ------------------------------------------------------------------
@@ -272,7 +329,12 @@ def get_model(c_in, args, head_type, weight_path=None):
 def find_lr(head_type):
     dls = get_dls(args)
     model = get_model(dls.vars, args, head_type)
-    model = transfer_weights(args.pretrained_model, model)
+    # For full finetuning: load linear probe checkpoint if provided, else pretrained model.
+    # For linear probing: always load pretrained model.
+    if args.linear_probe_model is not None:
+        model = transfer_weights(args.linear_probe_model, model)
+    else:
+        model = transfer_weights(args.pretrained_model, model)
 
     # Use the same weighted BCE as training so the LR finder sees a realistic
     # loss landscape rather than the collapsed all-negative trivial solution.
@@ -398,7 +460,15 @@ def finetune_func(lr=args.lr):
         ValidationROCAUCCB(),
         SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
         # SaveModelCB(monitor='valid_roc_auc', fname=args.save_finetuned_model, path=args.save_path)
+        # GeneralizationSaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
     ]
+
+    if args.use_wandb:
+        cbs.append(WandbCB(
+            project=args.wandb_project,
+            run_name=args.wandb_run_name or args.save_finetuned_model,
+            config=vars(args)
+        ))
 
     learn = Learner(
         dls,
@@ -469,6 +539,13 @@ def linear_probe_func(lr=args.lr):
         # SaveModelCB(monitor='valid_roc_auc', fname=args.save_finetuned_model, path=args.save_path)
     ]
 
+    if args.use_wandb:
+        cbs.append(WandbCB(
+            project=args.wandb_project,
+            run_name=args.wandb_run_name or args.save_finetuned_model,
+            config=vars(args)
+        ))
+
     learn = Learner(
         dls,
         model,
@@ -485,60 +562,412 @@ def linear_probe_func(lr=args.lr):
     save_recorders(learn)
 
 
+def _metrics_at_threshold(y_true, probs, threshold):
+    """
+    Compute the full suite of imbalance-aware classification metrics at a
+    given decision threshold.  Returns a flat dict of name → value.
+
+    WHY THESE METRICS (for highly imbalanced flu detection, ~0.04% prevalence):
+
+    Sensitivity (Recall/TPR) = TP / (TP + FN)
+        Fraction of true flu cases the model actually caught.
+        MOST IMPORTANT here — missing a flu onset is dangerous.
+        A model predicting all-negative gets 0.0.
+
+    Specificity (TNR) = TN / (TN + FP)
+        Fraction of healthy windows correctly identified as healthy.
+        Almost always high with extreme imbalance — do not rely on this alone.
+
+    Precision (PPV) = TP / (TP + FP)
+        Of all windows flagged as flu, how many truly are?
+        Low precision = many false alarms. Trades off with sensitivity.
+
+    NPV (Negative Predictive Value) = TN / (TN + FN)
+        Of all windows flagged as healthy, how many truly are?
+        Always near 1.0 when prevalence is low — less informative.
+
+    F1 = 2 * precision * recall / (precision + recall)
+        Harmonic mean of precision and recall. Balanced view.
+
+    F2 = (5 * precision * recall) / (4 * precision + recall)
+        Like F1 but weights recall 2x more than precision.
+        RIGHT choice for flu detection: missing a case is worse than a false alarm.
+
+    MCC (Matthews Correlation Coefficient) — range [-1, 1]
+        BEST SINGLE METRIC for imbalanced data. Accounts for all four
+        confusion matrix cells. 0 = no better than random, 1 = perfect.
+        Unlike accuracy/F1, not inflated by the dominant negative class.
+
+    Balanced Accuracy = (sensitivity + specificity) / 2
+        Accuracy corrected for imbalance. 0.5 = random, 1.0 = perfect.
+        Not inflated by the large negative class.
+    """
+    y_pred = (probs >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+
+    # Core rates
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0   # recall / TPR
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0   # TNR
+    precision   = tp / (tp + fp) if (tp + fp) > 0 else 0.0   # PPV
+    npv         = tn / (tn + fn) if (tn + fn) > 0 else 0.0   # NPV
+
+    # Composite scores
+    f1      = f1_score(y_true, y_pred, zero_division=0)
+    f2      = fbeta_score(y_true, y_pred, beta=2, zero_division=0)  # recall-weighted
+    mcc     = matthews_corrcoef(y_true, y_pred)                     # best for imbalance
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+
+    return dict(
+        TP=int(tp), FP=int(fp), TN=int(tn), FN=int(fn),
+        sensitivity=sensitivity,
+        specificity=specificity,
+        precision=precision,
+        npv=npv,
+        f1=f1,
+        f2=f2,
+        mcc=mcc,
+        balanced_accuracy=bal_acc,
+    )
+
+
+def _interpret_sensitivity(s, n_pos):
+    """Plain-English interpretation of sensitivity for flu detection."""
+    caught  = round(s * n_pos)
+    missed  = n_pos - caught
+    if s == 0.0:
+        return f'catching NO flu cases — model predicts all negative at this threshold'
+    elif s < 0.3:
+        return f'catching only {caught}/{n_pos} flu cases — missing {missed} ({(1-s)*100:.0f}%) — very poor for clinical use'
+    elif s < 0.6:
+        return f'catching {caught}/{n_pos} flu cases — missing {missed} ({(1-s)*100:.0f}%) — moderate'
+    elif s < 0.8:
+        return f'catching {caught}/{n_pos} flu cases — missing {missed} ({(1-s)*100:.0f}%) — reasonable'
+    else:
+        return f'catching {caught}/{n_pos} flu cases — missing only {missed} ({(1-s)*100:.0f}%) — strong'
+
+
+def _interpret_mcc(mcc):
+    """Plain-English interpretation of MCC."""
+    if mcc <= 0.0:
+        return 'no useful signal (≤ random)'
+    elif mcc < 0.2:
+        return 'weak signal'
+    elif mcc < 0.4:
+        return 'moderate signal'
+    elif mcc < 0.6:
+        return 'good signal'
+    else:
+        return 'strong signal'
+
+
+def _interpret_pr_auc(pr_auc, prevalence):
+    """Compare PR-AUC to random baseline (= prevalence)."""
+    if prevalence <= 0:
+        return ''
+    lift = pr_auc / prevalence
+    if lift < 2:
+        return f'{lift:.1f}x above random — poor'
+    elif lift < 10:
+        return f'{lift:.1f}x above random — moderate'
+    elif lift < 50:
+        return f'{lift:.1f}x above random — good'
+    else:
+        return f'{lift:.1f}x above random — excellent'
+
+
+def _find_pr_optimal_threshold(y_true, probs):
+    """
+    Find the threshold that maximises F1 on the Precision-Recall curve.
+
+    Returns
+    -------
+    threshold : float
+    best_f1   : float
+    prec_arr  : ndarray  (full precision array from precision_recall_curve)
+    rec_arr   : ndarray  (full recall array)
+    thresh_arr: ndarray  (candidate thresholds — one fewer element than prec/rec)
+    """
+    prec_arr, rec_arr, thresh_arr = precision_recall_curve(y_true, probs)
+    # prec_arr / rec_arr have one extra element at the end (trivial point);
+    # thresh_arr aligns with prec_arr[:-1] / rec_arr[:-1].
+    denom = prec_arr[:-1] + rec_arr[:-1]
+    f1_arr = np.where(denom > 0, 2 * prec_arr[:-1] * rec_arr[:-1] / denom, 0.0)
+    best_idx = int(np.argmax(f1_arr))
+    return float(thresh_arr[best_idx]), float(f1_arr[best_idx]), prec_arr, rec_arr, thresh_arr
+
+
+def _save_curves(
+    save_path, model_name,
+    train_data, val_data, test_data,
+    pr_opt_thresh_train, pr_opt_thresh_val,
+    youden_thresh_val,
+):
+    """
+    Plot and save PR curves and ROC curves for train / val / test splits.
+
+    Each tuple in *_data: (y_true, probs, split_label)
+    Optimal-threshold markers are drawn on the val curve only (where they
+    were derived), so the plot makes the threshold-selection procedure clear.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    colors = {'train': '#1f77b4', 'val': '#ff7f0e', 'test': '#2ca02c'}
+
+    # ── PR curves ────────────────────────────────────────────────────────────
+    ax_pr = axes[0]
+    for y_true, probs, label in [train_data, val_data, test_data]:
+        if len(np.unique(y_true)) < 2:
+            continue
+        prec, rec, _ = precision_recall_curve(y_true, probs)
+        auc_val = average_precision_score(y_true, probs)
+        ax_pr.plot(rec, prec, color=colors[label], lw=1.8,
+                   label=f'{label}  (PR-AUC={auc_val:.3f})')
+
+    # Mark PR-optimal threshold on val curve
+    val_true, val_probs, _ = val_data
+    if len(np.unique(val_true)) >= 2:
+        val_probs_arr = np.array(val_probs)
+        val_pred_val = (val_probs_arr >= pr_opt_thresh_val).astype(int)
+        p_val = val_pred_val[val_true == 1].mean() if val_pred_val.sum() > 0 else 0
+        r_val = val_pred_val[val_true == 1].mean() if val_pred_val.sum() > 0 else 0
+        # Compute exact precision/recall at the threshold
+        tp = ((val_pred_val == 1) & (val_true == 1)).sum()
+        fp = ((val_pred_val == 1) & (val_true == 0)).sum()
+        fn = ((val_pred_val == 0) & (val_true == 1)).sum()
+        p_pt = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r_pt = tp / (tp + fn) if (tp + fn) > 0 else 0
+        ax_pr.scatter([r_pt], [p_pt], color=colors['val'], s=120, zorder=5,
+                      marker='*', label=f'val PR-opt thresh={pr_opt_thresh_val:.3f}')
+
+    # Random baseline = prevalence of test set
+    test_true, _, _ = test_data
+    prevalence = test_true.mean()
+    ax_pr.axhline(prevalence, color='gray', lw=1, ls='--',
+                  label=f'random baseline ({prevalence:.4f})')
+    ax_pr.set_xlabel('Recall', fontsize=12)
+    ax_pr.set_ylabel('Precision', fontsize=12)
+    ax_pr.set_title('Precision-Recall Curves', fontsize=13)
+    ax_pr.legend(fontsize=9)
+    ax_pr.set_xlim([0, 1])
+    ax_pr.set_ylim([0, 1.02])
+    ax_pr.grid(alpha=0.3)
+
+    # ── ROC curves ───────────────────────────────────────────────────────────
+    ax_roc = axes[1]
+    for y_true, probs, label in [train_data, val_data, test_data]:
+        if len(np.unique(y_true)) < 2:
+            continue
+        fpr, tpr, _ = roc_curve(y_true, probs)
+        auc_val = roc_auc_score(y_true, probs)
+        ax_roc.plot(fpr, tpr, color=colors[label], lw=1.8,
+                    label=f'{label}  (ROC-AUC={auc_val:.3f})')
+
+    # Mark Youden's J threshold on val ROC curve
+    if len(np.unique(val_true)) >= 2:
+        fpr_v, tpr_v, thresh_v = roc_curve(val_true, val_probs_arr)
+        j_idx = int(np.argmax(tpr_v - fpr_v))
+        ax_roc.scatter([fpr_v[j_idx]], [tpr_v[j_idx]],
+                       color=colors['val'], s=120, zorder=5, marker='*',
+                       label=f"val Youden's J thresh={youden_thresh_val:.3f}")
+
+    ax_roc.plot([0, 1], [0, 1], 'k--', lw=1, label='random baseline')
+    ax_roc.set_xlabel('False Positive Rate', fontsize=12)
+    ax_roc.set_ylabel('True Positive Rate', fontsize=12)
+    ax_roc.set_title('ROC Curves', fontsize=13)
+    ax_roc.legend(fontsize=9)
+    ax_roc.set_xlim([0, 1])
+    ax_roc.set_ylim([0, 1.02])
+    ax_roc.grid(alpha=0.3)
+
+    plt.tight_layout()
+    out_path = save_path + model_name + '_pr_roc_curves.png'
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Curves saved → {out_path}')
+
+
+def _print_metrics_block(label, m, threshold, n_pos):
+    """Print a formatted block of metrics with inline interpretations."""
+    print(f'  {"─"*60}')
+    print(f'  Threshold : {threshold:.4f}  ({label})')
+    print(f'  {"─"*60}')
+    print(f'  Confusion matrix:')
+    print(f'    TP (flu caught)      = {m["TP"]:6d}')
+    print(f'    FN (flu missed)      = {m["FN"]:6d}   ← minimise this')
+    print(f'    FP (false alarms)    = {m["FP"]:6d}')
+    print(f'    TN (healthy correct) = {m["TN"]:6d}')
+    print(f'  {"─"*60}')
+    sens_note = _interpret_sensitivity(m['sensitivity'], n_pos)
+    print(f'  Sensitivity (Recall)  : {m["sensitivity"]:.4f}  — {sens_note}')
+    print(f'  Specificity           : {m["specificity"]:.4f}  — fraction of healthy windows correctly ID\'d')
+    print(f'  Precision (PPV)       : {m["precision"]:.4f}  — of flagged windows, fraction truly flu')
+    print(f'  NPV                   : {m["npv"]:.4f}  — of cleared windows, fraction truly healthy')
+    print(f'  {"─"*60}')
+    print(f'  F1                    : {m["f1"]:.4f}  — balanced precision/recall')
+    print(f'  F2 (recall-weighted)  : {m["f2"]:.4f}  — weights missing a case 2x worse than false alarm')
+    print(f'  MCC                   : {m["mcc"]:.4f}  — {_interpret_mcc(m["mcc"])}')
+    print(f'  Balanced Accuracy     : {m["balanced_accuracy"]:.4f}  — accuracy corrected for imbalance (0.5=random)')
+
+
 def test_func(weight_path):
+    # -------------------------------------------------------------------------
+    # Load all splits — we need train + val to find the optimal threshold,
+    # and test to evaluate it blind.  Correct procedure:
+    #
+    #   Train → PR-optimal threshold (max F1) — printed for reference
+    #   Val   → PR-optimal threshold (max F1) → applied blind to test
+    #   Test  → all metrics reported at @0.5 and @val-PR-optimal
+    #
+    # This avoids leakage of finding AND evaluating the threshold on the
+    # same data (which produces optimistically biased results).
+    # -------------------------------------------------------------------------
     dls = get_dls(args)
 
-    print("train labels:", dls.train.dataset.data["label"].unique(return_counts=True))
+    print("val   labels:", dls.valid.dataset.data["label"].unique(return_counts=True))
     print("test  labels:", dls.test.dataset.data["label"].unique(return_counts=True))
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = get_model(dls.vars, args, head_type=args.head_type).to(device)
+    model  = get_model(dls.vars, args, head_type=args.head_type).to(device)
 
-    #cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
-    cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
+    cbs  = [RevInCB(dls.vars, denorm=False)] if args.revin else []
     cbs += [PatchCB(patch_len=args.patch_len, stride=args.stride)]
 
     learn = Learner(dls, model, cbs=cbs)
 
-    preds, targets = learn.test(dls.test, weight_path=weight_path + '.pth')
+    # -------------------------------------------------------------------------
+    # Step 1 — Train + Val inference: find optimal threshold via PR curve
+    # Optimal threshold = argmax F1 on the Precision-Recall curve.
+    # PR-AUC is the primary metric here (dataset is severely imbalanced), so
+    # the threshold is derived from the PR curve rather than ROC.
+    #   Train → find PR-optimal threshold (reference / sanity check)
+    #   Val   → find PR-optimal threshold → applied BLIND to test set
+    # -------------------------------------------------------------------------
+    train_preds, train_targets = learn.test(dls.train, weight_path=weight_path + '.pth')
+    train_probs = (1 / (1 + np.exp(-np.array(train_preds).reshape(-1)))).astype(float)
+    train_true  = np.array(train_targets).reshape(-1).astype(int)
 
-    preds = np.array(preds)
-    targets = np.array(targets)
+    val_preds, val_targets = learn.test(dls.valid, weight_path=weight_path + '.pth')
+    val_probs  = (1 / (1 + np.exp(-np.array(val_preds).reshape(-1)))).astype(float)
+    val_true   = np.array(val_targets).reshape(-1).astype(int)
 
-    probs = 1 / (1 + np.exp(-preds.reshape(-1)))
-    y_true = targets.reshape(-1)
+    if len(np.unique(train_true)) >= 2:
+        pr_opt_thresh_train, pr_opt_f1_train, _, _, _ = _find_pr_optimal_threshold(train_true, train_probs)
+    else:
+        pr_opt_thresh_train, pr_opt_f1_train = 0.5, float('nan')
 
-    y_pred = (probs >= 0.5).astype(int)
+    if len(np.unique(val_true)) >= 2:
+        pr_opt_thresh_val, pr_opt_f1_val, _, _, _ = _find_pr_optimal_threshold(val_true, val_probs)
+        opt_threshold = pr_opt_thresh_val   # this is applied blind to test
+    else:
+        pr_opt_thresh_val, pr_opt_f1_val = 0.5, float('nan')
+        opt_threshold = 0.5
 
+    # -------------------------------------------------------------------------
+    # Step 2 — Test inference: evaluate blind using val-derived threshold
+    # -------------------------------------------------------------------------
+    test_preds, test_targets = learn.test(dls.test, weight_path=weight_path + '.pth')
+    probs  = (1 / (1 + np.exp(-np.array(test_preds).reshape(-1)))).astype(float)
+    y_true = np.array(test_targets).reshape(-1).astype(int)
+
+    prevalence = y_true.mean()
+    n_pos      = int(y_true.sum())
+
+    # -------------------------------------------------------------------------
+    # Threshold-independent metrics (test set)
+    # -------------------------------------------------------------------------
     if len(np.unique(y_true)) >= 2:
         roc_auc = roc_auc_score(y_true, probs)
-        pr_auc = average_precision_score(y_true, probs)
+        pr_auc  = average_precision_score(y_true, probs)
     else:
-        roc_auc = np.nan
-        pr_auc = np.nan
+        roc_auc = pr_auc = float('nan')
 
-    precision = precision_score(y_true, y_pred, zero_division=0)
+    # -------------------------------------------------------------------------
+    # Threshold-dependent metrics at two thresholds (both applied to test set)
+    #   @0.5     — fixed reference point
+    #   @optimal — PR-optimal threshold (max F1 on val PR curve) applied blind
+    # -------------------------------------------------------------------------
+    m_05  = _metrics_at_threshold(y_true, probs, threshold=0.5)
+    m_opt = _metrics_at_threshold(y_true, probs, threshold=opt_threshold) \
+            if not np.isnan(opt_threshold) else None
 
-    scores = [roc_auc, pr_auc, precision]
+    # -------------------------------------------------------------------------
+    # Print
+    # -------------------------------------------------------------------------
+    print()
+    print(f'  {"="*60}')
+    print(f'  TEST RESULTS')
+    print(f'  {"="*60}')
+    print(f'  NOTE: with {prevalence*100:.3f}% prevalence, accuracy and ROC-AUC are')
+    print(f'  misleading — a model predicting all-negative scores ~100% accuracy')
+    print(f'  and ROC-AUC can look decent. Focus on PR-AUC, MCC, Sensitivity,')
+    print(f'  and F2. The @optimal block is more informative than @0.5 because')
+    print(f'  @0.5 almost always predicts all-negative at this prevalence.')
+    print(f'  {"="*60}')
+    print(f'  Dataset (test set):')
+    print(f'    Total samples  : {len(y_true)}')
+    print(f'    Positives      : {n_pos}  (flu-onset windows)')
+    print(f'    Negatives      : {len(y_true) - n_pos}')
+    print(f'    Prevalence     : {prevalence:.5f}  ({prevalence*100:.3f}%)')
+    print(f'    Random PR-AUC  : {prevalence:.5f}  (baseline — a random model scores this)')
+    print()
+    print(f'  Optimal threshold selection (PR curve, max F1):')
+    print(f'    Train PR-optimal threshold : {pr_opt_thresh_train:.4f}  (best F1={pr_opt_f1_train:.4f} on train)')
+    print(f'    Val   PR-optimal threshold : {pr_opt_thresh_val:.4f}  (best F1={pr_opt_f1_val:.4f} on val)  ← used on test')
+    print(f'    Val positives              : {int(val_true.sum())}  /  {len(val_true)}')
+    print(f'    Train positives            : {int(train_true.sum())}  /  {len(train_true)}')
+    print()
+    print(f'  Threshold-independent metrics (test set):')
+    print(f'    PR-AUC  (primary) : {pr_auc:.4f}  — {_interpret_pr_auc(pr_auc, prevalence)}')
+    print(f'    ROC-AUC           : {roc_auc:.4f}  — ranking ability (0.5=random, 1.0=perfect)')
+    print()
+    _print_metrics_block('@0.5  (fixed reference)', m_05, threshold=0.5, n_pos=n_pos)
+    if m_opt is not None:
+        print()
+        _print_metrics_block(
+            "PR-optimal threshold from VAL (max F1 on val PR curve), applied to TEST",
+            m_opt, threshold=opt_threshold, n_pos=n_pos,
+        )
+    print(f'  {"="*60}')
 
-    # PR-AUC is the primary metric for imbalanced binary classification:
-    # it is not inflated by the large number of true negatives, unlike ROC-AUC.
-    # A random baseline achieves PR-AUC ≈ prevalence (fraction of positives).
-    print(f"--- Test results ---")
-    print(f"  PR-AUC   (primary): {pr_auc:.4f}")
-    print(f"  ROC-AUC           : {roc_auc:.4f}")
-    print(f"  Precision @0.5    : {precision:.4f}")
-
-    pd.DataFrame(
-        np.array(scores).reshape(1, -1),
-        columns=['roc_auc', 'pr_auc', 'precision']
-    ).to_csv(
-        args.save_path + args.save_finetuned_model + '_acc.csv',
-        float_format='%.6f',
-        index=False
+    # -------------------------------------------------------------------------
+    # Save PR + ROC curve plots
+    # -------------------------------------------------------------------------
+    _save_curves(
+        save_path=args.save_path,
+        model_name=args.save_finetuned_model,
+        train_data=(train_true, train_probs, 'train'),
+        val_data=(val_true, val_probs, 'val'),
+        test_data=(y_true, probs, 'test'),
+        pr_opt_thresh_train=pr_opt_thresh_train,
+        pr_opt_thresh_val=pr_opt_thresh_val,
+        youden_thresh_val=opt_threshold,
     )
 
-    return preds, targets, scores
+    # -------------------------------------------------------------------------
+    # Save CSV
+    # -------------------------------------------------------------------------
+    row = dict(
+        roc_auc=roc_auc, pr_auc=pr_auc,
+        pr_opt_threshold_train=pr_opt_thresh_train,
+        pr_opt_f1_train=pr_opt_f1_train,
+        pr_opt_threshold_val=pr_opt_thresh_val,
+        pr_opt_f1_val=pr_opt_f1_val,
+    )
+    for k, v in m_05.items():
+        row[f'{k}@0.5'] = v
+    if m_opt is not None:
+        for k, v in m_opt.items():
+            row[f'{k}@opt'] = v
+
+    pd.DataFrame([row]).to_csv(
+        args.save_path + args.save_finetuned_model + '_acc.csv',
+        float_format='%.6f',
+        index=False,
+    )
+
+    scores = [roc_auc, pr_auc, m_05['precision']]
+    return test_preds, test_targets, scores
 
 
 if __name__ == '__main__':
@@ -547,16 +976,18 @@ if __name__ == '__main__':
         args.dset = args.dset_finetune
 
         if is_distributed:
-            # Run lr_finder on rank 0 only, then broadcast the result so all
-            # ranks train with the same optimal LR (same pattern as pretrain).
             device = torch.device(f'cuda:{local_rank}')
             lr_tensor = torch.zeros(1, dtype=torch.float32, device=device)
 
             if rank == 0:
-                print("Running lr_finder on rank 0...")
-                suggested_lr = find_lr(head_type=args.head_type)
-                suggested_lr = float(suggested_lr)
-                print(f"[rank 0] Suggested LR: {suggested_lr:.6f}. Broadcasting to all ranks...")
+                if args.use_lr_finder:
+                    print("Running lr_finder on rank 0...")
+                    suggested_lr = find_lr(head_type=args.head_type)
+                    suggested_lr = float(suggested_lr)
+                    print(f"[rank 0] Suggested LR: {suggested_lr:.6f}. Broadcasting to all ranks...")
+                else:
+                    suggested_lr = args.lr
+                    print(f"[rank 0] Skipping LR finder, using fixed LR: {suggested_lr:.6f}. Broadcasting to all ranks...")
                 lr_tensor[0] = suggested_lr
 
             dist.broadcast(lr_tensor, src=0)
@@ -566,7 +997,12 @@ if __name__ == '__main__':
                 print("About to start finetuning")
             finetune_func(suggested_lr)
         else:
-            suggested_lr = find_lr(head_type=args.head_type)
+            if args.use_lr_finder:
+                suggested_lr = find_lr(head_type=args.head_type)
+            else:
+                suggested_lr = args.lr
+                if rank == 0:
+                    print(f"Skipping LR finder, using fixed LR: {suggested_lr:.6f}")
             finetune_func(suggested_lr)
 
         if rank == 0:
@@ -578,15 +1014,18 @@ if __name__ == '__main__':
         args.dset = args.dset_finetune
 
         if is_distributed:
-            # Same LR broadcast pattern as is_finetune above.
             device = torch.device(f'cuda:{local_rank}')
             lr_tensor = torch.zeros(1, dtype=torch.float32, device=device)
 
             if rank == 0:
-                print("Running lr_finder on rank 0...")
-                suggested_lr = find_lr(head_type=args.head_type)
-                suggested_lr = float(suggested_lr)
-                print(f"[rank 0] Suggested LR: {suggested_lr:.6f}. Broadcasting to all ranks...")
+                if args.use_lr_finder:
+                    print("Running lr_finder on rank 0...")
+                    suggested_lr = find_lr(head_type=args.head_type)
+                    suggested_lr = float(suggested_lr)
+                    print(f"[rank 0] Suggested LR: {suggested_lr:.6f}. Broadcasting to all ranks...")
+                else:
+                    suggested_lr = args.lr
+                    print(f"[rank 0] Skipping LR finder, using fixed LR: {suggested_lr:.6f}. Broadcasting to all ranks...")
                 lr_tensor[0] = suggested_lr
 
             dist.broadcast(lr_tensor, src=0)
@@ -596,7 +1035,12 @@ if __name__ == '__main__':
                 print("About to start linear probing")
             linear_probe_func(suggested_lr)
         else:
-            suggested_lr = find_lr(head_type=args.head_type)
+            if args.use_lr_finder:
+                suggested_lr = find_lr(head_type=args.head_type)
+            else:
+                suggested_lr = args.lr
+                if rank == 0:
+                    print(f"Skipping LR finder, using fixed LR: {suggested_lr:.6f}")
             linear_probe_func(suggested_lr)
 
         if rank == 0:
@@ -605,9 +1049,17 @@ if __name__ == '__main__':
             print('----------- Complete! -----------')
 
     else:
+        # Test-only mode: no training, just evaluate a saved checkpoint on the test set.
+        # Priority: --linear_probe_model > --pretrained_model > default finetuned path.
         args.dset = args.dset_finetune
-        weight_path = args.save_path + args.dset_finetune + '_patchtst_finetuned' + suffix_name
+        if args.linear_probe_model is not None:
+            weight_path = args.linear_probe_model.replace('.pth', '')
+        elif args.pretrained_model is not None:
+            weight_path = args.pretrained_model.replace('.pth', '')
+        else:
+            weight_path = args.save_path + args.dset_finetune + '_patchtst_finetuned' + suffix_name
 
         if rank == 0:
+            print(f"Test-only mode — loading weights from: {weight_path}.pth")
             out = test_func(weight_path)
             print('----------- Complete! -----------')

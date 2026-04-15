@@ -80,6 +80,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--resume_from', type=str, default=None,
                         help='path to a pretrained .pth checkpoint to resume from (optional)')
 
+    parser.add_argument('--use_wandb', type=int, default=0, help='enable Weights & Biases logging (1=yes, 0=no)')
+    parser.add_argument('--wandb_project', type=str, default='PatchTST-Wearable', help='wandb project name')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name (defaults to model save name)')
+
+    # Label-based sample filtering for pretraining
+    parser.add_argument(
+        '--label_filter',
+        type=str,
+        default='all',
+        choices=['all', 'positive', 'negative'],
+        help=(
+            "Filter training samples by their lookback-window label. "
+            "'all' trains on every sample (default); "
+            "'negative' trains only on healthy/label-0 samples; "
+            "'positive' trains only on label-1 samples."
+        )
+    )
+
     return parser
 
 
@@ -299,6 +317,13 @@ def pretrain_func(
             path=args.save_path
         )
     ]
+
+    if args.use_wandb:
+        cbs.append(WandbCB(
+            project=args.wandb_project,
+            run_name=args.wandb_run_name or args.save_pretrained_model,
+            config=vars(args)
+        ))
     if rank == 0:
         print(5)
 

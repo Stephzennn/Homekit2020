@@ -2,6 +2,30 @@
 # finetune.py — LearnedPatchTST Full Training Script
 # =============================================================================
 #
+# RESEARCH HYPOTHESIS:
+#
+#   Fixed stride patching imposes an arbitrary inductive bias on the temporal
+#   structure of physiological signals. We propose learning the patching scheme
+#   directly from the classification task using a lightweight supervised
+#   clustering module, bypassing the combinatorial search over patch/stride
+#   hyperparameters. The learned scheme — which may assign non-contiguous
+#   timesteps to the same patch and adapt the number of patches to input
+#   complexity — is then used as the tokenization function for masked
+#   self-supervised pretraining, decoupling patch discovery from backbone
+#   training. We hypothesize this produces a better-informed pretraining
+#   tokenization than manual stride selection, and test this on flu positivity
+#   prediction from wearable sensor data.
+#
+#   Critically, this method tailors the patching scheme to the specific
+#   downstream task. The optimal patch structure for flu positivity prediction
+#   may differ substantially from that of symptom severity, headache
+#   positivity, or fatigue — each task may exploit different temporal
+#   groupings of the physiological signal. Rather than using a single fixed
+#   patching scheme across all tasks, LearnedPatchTST discovers a
+#   task-specific tokenization, making the representation maximally
+#   informative for the prediction objective at hand.
+#
+# -----------------------------------------------------------------------------
 # PURPOSE:
 #   End-to-end training script for LearnedPatchTST.
 #   Mirrors the structure of PatchTST_self_supervised/patchtst_finetune.py

@@ -1,5 +1,5 @@
 __all__ = ['TrackTimerCB', 'TrackTrainingCB', 'PrintResultsCB', 'TerminateOnNaNCB',
-            'TrackerCB', 'SaveModelCB', 'EarlyStoppingCB']
+            'TrackerCB', 'SaveModelCB', 'EarlyStoppingCB', 'WandbCB']
 
 from ..basics import *
 from .core import Callback
@@ -264,24 +264,72 @@ class SaveModelCB(TrackerCB):
 
     def after_epoch(self):
         if self.every_epoch:
-            if ((self.epoch%self.every_epoch) == 0) or (self.epoch==self.n_epochs-1): 
-                self._save(f'{self.fname}_{self.epoch}', self.path)                            
+            if ((self.epoch%self.every_epoch) == 0) or (self.epoch==self.n_epochs-1):
+                self._save(f'{self.fname}_{self.epoch}', self.path)
         else:
             super().after_epoch()
             if self.new_best:
                 if self.global_rank == self.save_process_id:
-                    roc_str = ''
-                    if hasattr(self, 'learner') and 'valid_roc_auc' in self.learner.recorder:
-                        roc_vals = self.learner.recorder['valid_roc_auc']
+                    metric_str = ''
+                    if hasattr(self, 'learner'):
+                        roc_vals = self.learner.recorder.get('valid_roc_auc', [])
+                        pr_vals  = self.learner.recorder.get('valid_pr_auc', [])
                         if roc_vals:
-                            roc_str = f', val ROC-AUC: {roc_vals[-1]:.4f}'
-                    print(f'Better model found at epoch {self.epoch} with {self.monitor}: {self.best:.6f}{roc_str}')
+                            metric_str += f', val ROC-AUC: {roc_vals[-1]:.4f}'
+                        if pr_vals:
+                            metric_str += f', val PR-AUC: {pr_vals[-1]:.4f}'
+                    print(f'Better model found at epoch {self.epoch} with {self.monitor}: {self.best:.6f}{metric_str}')
                 self._save(f'{self.fname}', self.path)
 
     def after_fit(self):
         if self.run_finder: return
         if not self.every_epoch and self.global_rank == self.save_process_id:
             self.learner.load(self.last_saved_path, with_opt=self.with_opt)
+
+
+class WandbCB(Callback):
+    """Logs train_loss, valid_loss, valid_roc_auc, and valid_pr_auc to Weights & Biases after each epoch.
+    Only rank 0 logs — all other ranks skip silently.
+    """
+    def __init__(self, project, run_name=None, config=None):
+        super().__init__()
+        self._project = project
+        self._run_name = run_name
+        self._config = config or {}
+
+    def _is_rank0(self):
+        import os
+        return int(os.environ.get("RANK", 0)) == 0
+
+    def before_fit(self):
+        if self.run_finder or not self._is_rank0(): return
+        import wandb
+        wandb.init(
+            project=self._project,
+            name=self._run_name,
+            config=self._config,
+            resume='allow'
+        )
+
+    def after_epoch(self):
+        if self.run_finder or not self._is_rank0(): return
+        import wandb
+        recorder = self.learner.recorder
+        log_dict = {'epoch': self.epoch}
+        if recorder.get('train_loss'):
+            log_dict['train_loss'] = recorder['train_loss'][-1]
+        if recorder.get('valid_loss'):
+            log_dict['valid_loss'] = recorder['valid_loss'][-1]
+        if recorder.get('valid_roc_auc'):
+            log_dict['valid_roc_auc'] = recorder['valid_roc_auc'][-1]
+        if recorder.get('valid_pr_auc'):
+            log_dict['valid_pr_auc'] = recorder['valid_pr_auc'][-1]
+        wandb.log(log_dict, step=self.epoch)
+
+    def after_fit(self):
+        if self.run_finder or not self._is_rank0(): return
+        import wandb
+        wandb.finish()
 
 
 class EarlyStoppingCB(TrackerCB):

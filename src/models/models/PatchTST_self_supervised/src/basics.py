@@ -58,10 +58,14 @@ def default_device(use_cuda=True):
 
 def get_available_cuda(usage=10):
     if not torch.cuda.is_available(): return
-    # collect available cuda devices, only collect devices that has less that 'usage' percent 
+    # collect available cuda devices, only collect devices that has less that 'usage' percent
+    # MIG-partitioned GPUs do not support utilization queries — treat them as available
     device_ids = []
     for device in range(torch.cuda.device_count()):
-        if torch.cuda.utilization(device) < usage: device_ids.append(device)
+        try:
+            if torch.cuda.utilization(device) < usage: device_ids.append(device)
+        except Exception:
+            device_ids.append(device)
     return device_ids
 
 
