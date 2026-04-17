@@ -1,15 +1,13 @@
 #!/bin/bash
 #SBATCH --job-name=patchtst_pretrain_positive
 #SBATCH --nodes=1
-#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=2
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --account=coc
-#SBATCH --qos=coc-ice
+#SBATCH --mem=500G
 #SBATCH --account=coc
 #SBATCH --qos=coc-ice
 #SBATCH --partition=coc-gpu,ice-gpu
-#SBATCH --time=11:00:00
+#SBATCH --time=05:00:00
 #SBATCH --gres=gpu:2
 #SBATCH --constraint=nvidia-gpu
 #SBATCH --output=/home/hice1/ezg6/projects/Homekit2020/logs/%x-%j.out
@@ -34,8 +32,7 @@ echo "Node: $(hostname)"
 echo "Job ID: ${SLURM_JOB_ID}"
 
 # ── Environment ──────────────────────────────────────────────────────────────
-module load anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
+source ~/.bashrc
 conda activate Homekit2020
 
 # ── DDP / thread settings ────────────────────────────────────────────────────
