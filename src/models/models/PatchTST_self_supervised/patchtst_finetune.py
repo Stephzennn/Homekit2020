@@ -193,6 +193,10 @@ parser.add_argument('--model_type', type=str, default='based_model', help='for m
 # Set to -1 to use the raw ratio with no cap.
 parser.add_argument('--pos_weight_cap', type=float, default=-1.0,
                     help='maximum value for BCEWithLogitsLoss pos_weight (caps n_neg/n_pos ratio); -1 = no cap')
+parser.add_argument('--neg_subsample_ratio', type=int, default=0,
+                    help='keep this many negatives per positive in the training set; 0 = disabled (use all)')
+parser.add_argument('--seed', type=int, default=42,
+                    help='random seed for negative undersampling')
 
 parser.add_argument('--use_wandb', type=int, default=0, help='enable Weights & Biases logging (1=yes, 0=no)')
 parser.add_argument('--wandb_project', type=str, default='PatchTST-Wearable', help='wandb project name')

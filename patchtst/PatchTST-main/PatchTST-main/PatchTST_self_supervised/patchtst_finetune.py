@@ -16,7 +16,7 @@ from src.callback.transforms import *
 from src.metrics import *
 from src.basics import set_device
 from datautils import *
-
+from xgboost import XGBClassifiers
 import argparse
 
 
@@ -261,7 +261,14 @@ def linear_probe_func(lr=args.lr):
     learn.linear_probe(n_epochs=args.n_epochs_finetune, base_lr=lr)
     save_recorders(learn)
 
+def xgBoost(lr=args.lr):
+    dls = get_dls(args)
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = get_model(dls.vars, args, head_type='classification').to(device)
+
+    
+    
 def test_func(weight_path):
     dls = get_dls(args)
 

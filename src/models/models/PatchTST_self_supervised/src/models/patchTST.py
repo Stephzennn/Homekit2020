@@ -97,6 +97,8 @@ class RegressionHead(nn.Module):
         return y
 
 
+
+
 class ClassificationHead(nn.Module):
     def __init__(self, n_vars, d_model, n_classes, head_dropout):
         super().__init__()
@@ -115,7 +117,27 @@ class ClassificationHead(nn.Module):
         y = self.linear(x)         # y: bs x n_classes
         return y
 
+class ClassificationHeadXgboost(nn.Module):
+    def __init__(self, n_vars, d_model, n_classes, head_dropout):
+        super().__init__()
+        self.flatten = nn.Flatten(start_dim=1)
+        self.dropout = nn.Dropout(head_dropout)
+        self.linear = nn.Linear(n_vars*d_model, n_classes)
+    def forward(self, x):
+        """
+        x: [bs x nvars x d_model x num_patch]
+        output: [bs x n_classes]
+        """
+        
+        
+        
+        
+import xgboost as xgb
 
+from gbnet import xgbmodule
+
+        
+        
 class PredictionHead(nn.Module):
     def __init__(self, individual, n_vars, d_model, num_patch, forecast_len, head_dropout=0, flatten=False):
         super().__init__()

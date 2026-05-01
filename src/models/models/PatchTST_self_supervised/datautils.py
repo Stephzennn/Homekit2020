@@ -83,6 +83,8 @@ class DataLoadersV2:
         autoencoder_label: bool = False,
         splits=('train', 'val', 'test'),
         label_filter: str = 'all',
+        neg_subsample_ratio: int = 0,
+        seed: int = 42,
     ):
         super().__init__()
 
@@ -100,6 +102,8 @@ class DataLoadersV2:
         if label_filter not in ('all', 'positive', 'negative'):
             raise ValueError(f"label_filter must be 'all', 'positive', or 'negative'; got '{label_filter}'")
         self.label_filter = label_filter
+        self.neg_subsample_ratio = neg_subsample_ratio
+        self.seed = seed
 
         if self.datasetCls is None and self.taskCls is None:
             raise ValueError("Provide either datasetCls or taskCls")
@@ -185,6 +189,10 @@ class DataLoadersV2:
                 )
                 return None
 
+        # Negative undersampling: keep at most neg_subsample_ratio negatives per positive.
+        if split == 'train' and self.neg_subsample_ratio > 0:
+            dataset = self._subsample_negatives(dataset, self.neg_subsample_ratio, self.seed)
+
         return DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -256,6 +264,43 @@ class DataLoadersV2:
                 filtered[k] = [v[i] for i in indices]
 
         return DictDataset(filtered)
+
+    def _subsample_negatives(self, dataset: 'DictDataset', ratio: int, seed: int) -> 'DictDataset':
+        """Keep at most `ratio` negatives per positive in the training set."""
+        labels = dataset.data['label']
+        if torch.is_tensor(labels):
+            flat_labels = labels.view(len(labels), -1)[:, 0]
+            pos_idx = (flat_labels >= 1).nonzero(as_tuple=False).squeeze(1).tolist()
+            neg_idx = (flat_labels == 0).nonzero(as_tuple=False).squeeze(1).tolist()
+        else:
+            pos_idx = [i for i, v in enumerate(labels) if float(v) >= 1]
+            neg_idx = [i for i, v in enumerate(labels) if float(v) == 0]
+
+        keep_n = min(len(neg_idx), len(pos_idx) * ratio)
+        rng = np.random.default_rng(seed)
+        kept_neg = rng.choice(neg_idx, size=keep_n, replace=False).tolist()
+
+        indices = sorted(pos_idx + kept_neg)
+
+        import os
+        rank = int(os.environ.get("RANK", 0))
+        print(
+            f"[rank {rank}] neg_subsample_ratio={ratio}: "
+            f"kept {len(pos_idx)} pos + {keep_n} neg "
+            f"(from {len(neg_idx)}) = {len(indices)} total training samples.",
+            flush=True,
+        )
+
+        subsampled = {}
+        for k, v in dataset.data.items():
+            if torch.is_tensor(v):
+                subsampled[k] = v[indices]
+            elif isinstance(v, np.ndarray):
+                subsampled[k] = v[indices]
+            else:
+                subsampled[k] = [v[i] for i in indices]
+
+        return DictDataset(subsampled)
 
     # ------------------------------------------------------------------
     # Task/parquet materialization
@@ -681,6 +726,8 @@ def get_dls(params, test_only=False):
              workers=params.num_workers,
              splits=('test',) if test_only else ('train', 'val', 'test'),
              label_filter=getattr(params, 'label_filter', 'all'),
+             neg_subsample_ratio=getattr(params, 'neg_subsample_ratio', 0),
+             seed=getattr(params, 'seed', 42),
         )
 
     # --------------------------------------------------------------

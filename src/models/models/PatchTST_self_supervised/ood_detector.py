@@ -57,13 +57,179 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+import pandas as pd
+
 from sklearn.covariance import LedoitWolf
-from sklearn.metrics import roc_auc_score, roc_curve, average_precision_score, precision_recall_curve
+from sklearn.metrics import (
+    roc_auc_score, roc_curve, average_precision_score, precision_recall_curve,
+    f1_score, fbeta_score, matthews_corrcoef, balanced_accuracy_score,
+    confusion_matrix,
+)
 
 from src.models.patchTST import PatchTST
 from src.models.layers.revin import RevIN
 from src.callback.patch_mask import create_patch
 from datautils import get_dls
+
+
+# ---------------------------------------------------------------------------
+# Metrics helpers — mirror patchtst_finetune.py exactly
+# ---------------------------------------------------------------------------
+def _metrics_at_threshold(y_true, probs, threshold):
+    y_pred = (probs >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    precision   = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    npv         = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+    f1      = f1_score(y_true, y_pred, zero_division=0)
+    f2      = fbeta_score(y_true, y_pred, beta=2, zero_division=0)
+    mcc     = matthews_corrcoef(y_true, y_pred)
+    bal_acc = balanced_accuracy_score(y_true, y_pred)
+    return dict(
+        TP=int(tp), FP=int(fp), TN=int(tn), FN=int(fn),
+        sensitivity=sensitivity, specificity=specificity,
+        precision=precision, npv=npv,
+        f1=f1, f2=f2, mcc=mcc, balanced_accuracy=bal_acc,
+    )
+
+
+def _find_pr_optimal_threshold(y_true, probs):
+    prec_arr, rec_arr, thresh_arr = precision_recall_curve(y_true, probs)
+    denom  = prec_arr[:-1] + rec_arr[:-1]
+    f1_arr = np.where(denom > 0, 2 * prec_arr[:-1] * rec_arr[:-1] / denom, 0.0)
+    best_idx = int(np.argmax(f1_arr))
+    return float(thresh_arr[best_idx]), float(f1_arr[best_idx]), prec_arr, rec_arr, thresh_arr
+
+
+def _interpret_sensitivity(s, n_pos):
+    caught = round(s * n_pos)
+    missed = n_pos - caught
+    if s == 0.0:
+        return 'catching NO flu cases — model predicts all negative at this threshold'
+    elif s < 0.3:
+        return f'catching only {caught}/{n_pos} flu cases — missing {missed} ({(1-s)*100:.0f}%) — very poor'
+    elif s < 0.6:
+        return f'catching {caught}/{n_pos} flu cases — missing {missed} ({(1-s)*100:.0f}%) — moderate'
+    elif s < 0.8:
+        return f'catching {caught}/{n_pos} flu cases — missing {missed} ({(1-s)*100:.0f}%) — reasonable'
+    else:
+        return f'catching {caught}/{n_pos} flu cases — missing only {missed} ({(1-s)*100:.0f}%) — strong'
+
+
+def _interpret_mcc(mcc):
+    if mcc <= 0.0:
+        return 'no useful signal (≤ random)'
+    elif mcc < 0.2:
+        return 'weak signal'
+    elif mcc < 0.4:
+        return 'moderate signal'
+    elif mcc < 0.6:
+        return 'good signal'
+    else:
+        return 'strong signal'
+
+
+def _interpret_pr_auc(pr_auc, prevalence):
+    if prevalence <= 0:
+        return ''
+    lift = pr_auc / prevalence
+    if lift < 2:
+        return f'{lift:.1f}x above random — poor'
+    elif lift < 10:
+        return f'{lift:.1f}x above random — moderate'
+    elif lift < 50:
+        return f'{lift:.1f}x above random — good'
+    else:
+        return f'{lift:.1f}x above random — excellent'
+
+
+def _print_metrics_block(label, m, threshold, n_pos):
+    print(f'  {"─"*60}')
+    print(f'  Threshold : {threshold:.4f}  ({label})')
+    print(f'  {"─"*60}')
+    print(f'  Confusion matrix:')
+    print(f'    TP (flu caught)      = {m["TP"]:6d}')
+    print(f'    FN (flu missed)      = {m["FN"]:6d}   ← minimise this')
+    print(f'    FP (false alarms)    = {m["FP"]:6d}')
+    print(f'    TN (healthy correct) = {m["TN"]:6d}')
+    print(f'  {"─"*60}')
+    sens_note = _interpret_sensitivity(m['sensitivity'], n_pos)
+    print(f'  Sensitivity (Recall)  : {m["sensitivity"]:.4f}  — {sens_note}')
+    print(f'  Specificity           : {m["specificity"]:.4f}  — fraction of healthy windows correctly ID\'d')
+    print(f'  Precision (PPV)       : {m["precision"]:.4f}  — of flagged windows, fraction truly flu')
+    print(f'  NPV                   : {m["npv"]:.4f}  — of cleared windows, fraction truly healthy')
+    print(f'  {"─"*60}')
+    print(f'  F1                    : {m["f1"]:.4f}  — balanced precision/recall')
+    print(f'  F2 (recall-weighted)  : {m["f2"]:.4f}  — weights missing a case 2x worse than false alarm')
+    print(f'  MCC                   : {m["mcc"]:.4f}  — {_interpret_mcc(m["mcc"])}')
+    print(f'  Balanced Accuracy     : {m["balanced_accuracy"]:.4f}  — accuracy corrected for imbalance (0.5=random)')
+
+
+def _save_pr_roc_curves(out_dir, model_tag, val_data, test_data, pr_opt_thresh_val):
+    """Save PR + ROC curves for val and test splits."""
+    os.makedirs(out_dir, exist_ok=True)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    colors = {'val': '#ff7f0e', 'test': '#2ca02c'}
+
+    ax_pr = axes[0]
+    for y_true, probs, label in [val_data, test_data]:
+        if len(np.unique(y_true)) < 2:
+            continue
+        prec, rec, _ = precision_recall_curve(y_true, probs)
+        auc_val = average_precision_score(y_true, probs)
+        ax_pr.plot(rec, prec, color=colors[label], lw=1.8,
+                   label=f'{label}  (PR-AUC={auc_val:.3f})')
+
+    val_true, val_probs, _ = val_data
+    if len(np.unique(val_true)) >= 2:
+        val_pred = (np.array(val_probs) >= pr_opt_thresh_val).astype(int)
+        tp = ((val_pred == 1) & (val_true == 1)).sum()
+        fp = ((val_pred == 1) & (val_true == 0)).sum()
+        fn = ((val_pred == 0) & (val_true == 1)).sum()
+        p_pt = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r_pt = tp / (tp + fn) if (tp + fn) > 0 else 0
+        ax_pr.scatter([r_pt], [p_pt], color=colors['val'], s=120, zorder=5,
+                      marker='*', label=f'val PR-opt thresh={pr_opt_thresh_val:.3f}')
+
+    test_true, _, _ = test_data
+    prevalence = test_true.mean()
+    ax_pr.axhline(prevalence, color='gray', lw=1, ls='--',
+                  label=f'random baseline ({prevalence:.4f})')
+    ax_pr.set_xlabel('Recall', fontsize=12)
+    ax_pr.set_ylabel('Precision', fontsize=12)
+    ax_pr.set_title('Precision-Recall Curves  (p_positive score)', fontsize=13)
+    ax_pr.legend(fontsize=9)
+    ax_pr.set_xlim([0, 1]); ax_pr.set_ylim([0, 1.02]); ax_pr.grid(alpha=0.3)
+
+    ax_roc = axes[1]
+    for y_true, probs, label in [val_data, test_data]:
+        if len(np.unique(y_true)) < 2:
+            continue
+        fpr, tpr, _ = roc_curve(y_true, probs)
+        auc_val = roc_auc_score(y_true, probs)
+        ax_roc.plot(fpr, tpr, color=colors[label], lw=1.8,
+                    label=f'{label}  (ROC-AUC={auc_val:.3f})')
+
+    if len(np.unique(val_true)) >= 2:
+        fpr_v, tpr_v, _ = roc_curve(val_true, np.array(val_probs))
+        j_idx = int(np.argmax(tpr_v - fpr_v))
+        ax_roc.scatter([fpr_v[j_idx]], [tpr_v[j_idx]],
+                       color=colors['val'], s=120, zorder=5, marker='*',
+                       label=f"val Youden's J")
+
+    ax_roc.plot([0, 1], [0, 1], 'k--', lw=1, label='random baseline')
+    ax_roc.set_xlabel('False Positive Rate', fontsize=12)
+    ax_roc.set_ylabel('True Positive Rate', fontsize=12)
+    ax_roc.set_title('ROC Curves  (p_positive score)', fontsize=13)
+    ax_roc.legend(fontsize=9)
+    ax_roc.set_xlim([0, 1]); ax_roc.set_ylim([0, 1.02]); ax_roc.grid(alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(out_dir, f'ood_pr_roc_{model_tag}.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Curves saved → {out_path}')
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +569,41 @@ class MahalanobisOODDetector:
         log_ratio = 0.5 * (d_neg ** 2 - d_flu ** 2) + volume_correction
         return 1.0 / (1.0 + np.exp(-log_ratio))    # sigmoid
 
+    # ------------------------------------------------------------------
+    # Two-model scoring: each model's embeddings go to their own distribution
+    # ------------------------------------------------------------------
+    def score_two_models(self, emb_pos, emb_neg):
+        """
+        Proper two-model OOD score:
+          d_flu = Mahalanobis(emb_pos, lw_flu)  — pos-model embedding vs flu distribution
+          d_neg = Mahalanobis(emb_neg, lw_neg)  — neg-model embedding vs neg distribution
+        Combined using self.combine (bayes / min / average).
+        """
+        if len(self.estimators) != 2:
+            raise RuntimeError("score_two_models requires exactly 2 fitted estimators.")
+        d_flu = self._mahalanobis(self.estimators[0], emb_pos)
+        d_neg = self._mahalanobis(self.estimators[1], emb_neg)
+        return self._combine_distances([d_flu, d_neg])
+
+    def class_prob_two_models(self, emb_pos, emb_neg):
+        """
+        Bayesian P(flu | window) using proper two-model embeddings:
+          d_flu from positive-model embeddings vs flu distribution
+          d_neg from negative-model embeddings vs neg distribution
+
+        P(flu | window) = σ( ½(d_neg² − d_flu²) + ½(log|Λ_flu| − log|Λ_neg|) )
+        """
+        if len(self.estimators) != 2:
+            raise RuntimeError("class_prob_two_models requires exactly 2 fitted estimators.")
+        lw_flu, lw_neg = self.estimators[0], self.estimators[1]
+        d_flu = self._mahalanobis(lw_flu, emb_pos)
+        d_neg = self._mahalanobis(lw_neg, emb_neg)
+        log_det_flu = np.linalg.slogdet(lw_flu.precision_)[1]
+        log_det_neg = np.linalg.slogdet(lw_neg.precision_)[1]
+        volume_correction = 0.5 * (log_det_flu - log_det_neg)
+        log_ratio = 0.5 * (d_neg ** 2 - d_flu ** 2) + volume_correction
+        return 1.0 / (1.0 + np.exp(-log_ratio))
+
     def predict(self, X, threshold=None):
         """
         Returns
@@ -632,29 +833,163 @@ def main():
 
     # ---- EVALUATE MODE ------------------------------------------------------
     elif args.mode == "evaluate":
+        n_models = len(args.model_paths)
         print("=" * 60)
-        print(f"EVALUATE MODE — scoring {args.eval_split} split")
+        print(f"EVALUATE MODE ({'1-model negative-only' if n_models == 1 else '2-model'}) "
+              f"— val → find threshold → test (full report)")
         print("=" * 60)
 
         detector = MahalanobisOODDetector.load(args.load_detector)
-
-        dl = split_map[args.eval_split]
-        if dl is None:
-            raise RuntimeError(f"No dataloader for split '{args.eval_split}'")
-
-        # Extract embeddings from first model path (for scoring)
-        print(f"\nExtracting embeddings from: {args.model_paths[0]}")
-        model = build_model(args.model_paths[0], args, device)
-        captured, hook = register_embedding_hook(model)
-        emb, lbl = extract_embeddings(model, dl, revin, captured, args, device)
-        hook.remove()
-
         os.makedirs(args.out_dir, exist_ok=True)
-        evaluate(detector, emb, lbl,
-                 threshold=args.threshold,
-                 out_dir=args.out_dir,
-                 split_name=args.eval_split,
-                 model_tag=model_tag)
+
+        def _extract_one(ckpt, split_dl, split_name, label):
+            print(f"\n  [{split_name}] Extracting embeddings from {label} model …")
+            m = build_model(ckpt, args, device)
+            cap, hook = register_embedding_hook(m)
+            emb, lbl = extract_embeddings(m, split_dl, revin, cap, args, device)
+            hook.remove()
+            return emb, lbl
+
+        def _get_scores(split_dl, split_name):
+            if n_models == 1:
+                # Single negative model: d_neg = distance from healthy distribution
+                # Higher d_neg → more unlike healthy → treated as flu score
+                emb, lbl = _extract_one(args.model_paths[0], split_dl, split_name, "negative")
+                scores = detector._mahalanobis(detector.estimators[1], emb)
+                return scores, lbl
+            else:
+                # Two-model Bayesian pipeline
+                emb_pos, lbl = _extract_one(args.model_paths[0], split_dl, split_name, "positive")
+                emb_neg, _   = _extract_one(args.model_paths[1], split_dl, split_name, "negative")
+                scores = detector.class_prob_two_models(emb_pos, emb_neg)
+                return scores, lbl
+
+        score_label = "d_neg (Mahalanobis from healthy)" if n_models == 1 else "p(flu|window) Bayesian"
+
+        # ── Val split ────────────────────────────────────────────────────────
+        val_scores, val_lbl = _get_scores(dls.valid, "val")
+
+        if len(np.unique(val_lbl)) >= 2:
+            pr_opt_thresh_val, pr_opt_f1_val, _, _, _ = _find_pr_optimal_threshold(val_lbl, val_scores)
+            val_pr_auc  = average_precision_score(val_lbl, val_scores)
+            val_roc_auc = roc_auc_score(val_lbl, val_scores)
+        else:
+            pr_opt_thresh_val, pr_opt_f1_val = 0.5, float('nan')
+            val_pr_auc = val_roc_auc = float('nan')
+
+        # ── Test split ───────────────────────────────────────────────────────
+        test_scores, test_lbl = _get_scores(dls.test, "test")
+
+        prevalence = test_lbl.mean()
+        n_pos      = int(test_lbl.sum())
+
+        if len(np.unique(test_lbl)) >= 2:
+            test_pr_auc  = average_precision_score(test_lbl, test_scores)
+            test_roc_auc = roc_auc_score(test_lbl, test_scores)
+        else:
+            test_pr_auc = test_roc_auc = float('nan')
+
+        # OOD flagging (raw Mahalanobis combined score vs train threshold)
+        if n_models == 1:
+            val_ood_scores  = val_scores
+            test_ood_scores = test_scores
+        else:
+            # recompute raw OOD score for flagging
+            emb_p, lbl_v  = _extract_one(args.model_paths[0], dls.valid, "val-ood", "positive")
+            emb_n, _      = _extract_one(args.model_paths[1], dls.valid, "val-ood", "negative")
+            val_ood_scores  = detector.score_two_models(emb_p, emb_n)
+            emb_p, _      = _extract_one(args.model_paths[0], dls.test, "test-ood", "positive")
+            emb_n, _      = _extract_one(args.model_paths[1], dls.test, "test-ood", "negative")
+            test_ood_scores = detector.score_two_models(emb_p, emb_n)
+
+        val_ood_flag  = (val_ood_scores  > detector.threshold).sum()
+        test_ood_flag = (test_ood_scores > detector.threshold).sum()
+
+        # ── Full metrics at two thresholds ───────────────────────────────────
+        m_05  = _metrics_at_threshold(test_lbl, test_scores, threshold=0.5 if n_models == 2
+                                      else float(np.percentile(test_scores, 95)))
+        m_opt = _metrics_at_threshold(test_lbl, test_scores, threshold=pr_opt_thresh_val)
+
+        fixed_thresh_label = '0.5' if n_models == 2 else 'p95 of test scores'
+        fixed_thresh_val   = 0.5   if n_models == 2 else float(np.percentile(test_scores, 95))
+
+        # ── Print report ─────────────────────────────────────────────────────
+        print()
+        print(f'  {"="*60}')
+        print(f'  OOD DETECTOR — FULL EVALUATION REPORT')
+        if n_models == 1:
+            print(f'  Pipeline: window → neg model → emb_neg → d_neg → threshold')
+            print(f'  Score   : Mahalanobis distance from healthy distribution')
+            print(f'            (higher = more unlike healthy = more flu-like)')
+        else:
+            print(f'  Pipeline: window → pos model → emb_pos → d_flu')
+            print(f'            window → neg model → emb_neg → d_neg')
+            print(f'            Bayesian combine → p(flu|window) → threshold')
+            print(f'  Combine method : {detector.combine}')
+        print(f'  {"="*60}')
+        print()
+        print(f'  OOD detection (Mahalanobis score, train threshold={detector.threshold:.4f}):')
+        print(f'    Val  flagged as OOD : {val_ood_flag} / {len(val_lbl)}  ({100*val_ood_flag/len(val_lbl):.1f}%)')
+        print(f'    Test flagged as OOD : {test_ood_flag} / {len(test_lbl)}  ({100*test_ood_flag/len(test_lbl):.1f}%)')
+        print()
+        print(f'  {"="*60}')
+        print(f'  TEST RESULTS  (classification via {score_label})')
+        print(f'  {"="*60}')
+        print(f'  NOTE: with {prevalence*100:.3f}% prevalence, focus on PR-AUC, MCC,')
+        print(f'  Sensitivity, and F2. @optimal is more informative than the fixed threshold.')
+        print(f'  {"="*60}')
+        print(f'  Dataset (test set):')
+        print(f'    Total samples  : {len(test_lbl)}')
+        print(f'    Positives      : {n_pos}  (flu-onset windows)')
+        print(f'    Negatives      : {len(test_lbl) - n_pos}')
+        print(f'    Prevalence     : {prevalence:.5f}  ({prevalence*100:.3f}%)')
+        print(f'    Random PR-AUC  : {prevalence:.5f}  (baseline)')
+        print()
+        print(f'  Threshold selection (PR curve, max F1 on val):')
+        print(f'    Val  PR-optimal threshold : {pr_opt_thresh_val:.4f}  (best F1={pr_opt_f1_val:.4f} on val)  ← used on test')
+        print(f'    Val  positives            : {int(val_lbl.sum())}  /  {len(val_lbl)}')
+        print()
+        print(f'  Threshold-independent metrics:')
+        print(f'    PR-AUC  (primary) — val  : {val_pr_auc:.4f}   test : {test_pr_auc:.4f}  — {_interpret_pr_auc(test_pr_auc, prevalence)}')
+        print(f'    ROC-AUC           — val  : {val_roc_auc:.4f}   test : {test_roc_auc:.4f}')
+        print()
+        _print_metrics_block(f'@{fixed_thresh_label}  (fixed reference)', m_05,
+                             threshold=fixed_thresh_val, n_pos=n_pos)
+        print()
+        _print_metrics_block(
+            'PR-optimal threshold from VAL (max F1 on val PR curve), applied to TEST',
+            m_opt, threshold=pr_opt_thresh_val, n_pos=n_pos,
+        )
+        print(f'  {"="*60}')
+
+        # ── Save PR + ROC curves ──────────────────────────────────────────────
+        _save_pr_roc_curves(
+            out_dir=args.out_dir,
+            model_tag=model_tag,
+            val_data=(val_lbl, val_scores, 'val'),
+            test_data=(test_lbl, test_scores, 'test'),
+            pr_opt_thresh_val=pr_opt_thresh_val,
+        )
+
+        # ── Save CSV ─────────────────────────────────────────────────────────
+        row = dict(
+            n_models=n_models,
+            val_pr_auc=val_pr_auc, val_roc_auc=val_roc_auc,
+            test_pr_auc=test_pr_auc, test_roc_auc=test_roc_auc,
+            pr_opt_threshold_val=pr_opt_thresh_val,
+            pr_opt_f1_val=pr_opt_f1_val,
+            ood_threshold=detector.threshold,
+            val_pct_ood=100*val_ood_flag/len(val_lbl),
+            test_pct_ood=100*test_ood_flag/len(test_lbl),
+        )
+        for k, v in m_05.items():
+            row[f'{k}@fixed'] = v
+        for k, v in m_opt.items():
+            row[f'{k}@opt'] = v
+
+        csv_path = os.path.join(args.out_dir, f'ood_results_{model_tag}.csv')
+        pd.DataFrame([row]).to_csv(csv_path, float_format='%.6f', index=False)
+        print(f'\n  Results CSV saved → {csv_path}')
 
     print("\nDone.")
 
