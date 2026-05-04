@@ -43,7 +43,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 #   pos_weight_cap=1: no extra upweighting — undersampling is enough (matches best binary setup)
 python \
   Homekit2020/src/models/models/PatchTST_self_supervised/stage2_binary_mlp.py \
-  --checkpoint "/home/hice1/ezg6/projects/saved_models/Wearable_3class/masked_patchtst/Three_Class_finetune_patch1440_stride180/Wearable_3class_patchtst_finetuned_cw10080_tw3_patch1440_stride180_epochs-finetune60_model35022026.pth" \
+  --checkpoint "/home/hice1/ezg6/projects/saved_models/Wearable_3class/masked_patchtst/Three_Class_finetune_patch1440_stride180/Wearable_3class_patchtst_finetuned_cw10080_tw3_patch1440_stride180_epochs-finetune60_model35032026.pth" \
   --context_points 10080 \
   --target_points 3 \
   --patch_len 1440 \
