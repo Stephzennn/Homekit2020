@@ -58,7 +58,7 @@ if root not in sys.path:
 from src.models.eval import classification_eval, regression_eval
 from src.data.utils import load_processed_table, url_from_path
 from src.utils import get_logger, read_yaml
-from src.models.lablers import (FluPosLabler, ClauseLabler, EvidationILILabler,
+from src.models.lablers import (FluPosLabler, FluThreeClassLabler, ClauseLabler, EvidationILILabler,
                                 DayOfWeekLabler, AudereObeseLabler, DailyFeaturesLabler, FluPosWeakLabler,
                                 CovidLabler, SameParticipantLabler, SequentialLabler, CovidSignalsLabler)
 
@@ -70,7 +70,7 @@ from models.transforms import DefaultTransformRow
 from models.eval import classification_eval, regression_eval
 from data.utils import load_processed_table, url_from_path
 from utils import get_logger, read_yaml
-from models.lablers import (FluPosLabler, ClauseLabler, EvidationILILabler,
+from models.lablers import (FluPosLabler, FluThreeClassLabler, ClauseLabler, EvidationILILabler,
                                 DayOfWeekLabler, AudereObeseLabler, DailyFeaturesLabler, FluPosWeakLabler,
                                 CovidLabler, SameParticipantLabler, SequentialLabler, CovidSignalsLabler)
 
@@ -545,6 +545,34 @@ class PredictFluPos(ActivityTask):
 
     def get_name(self):
         return "PredictFluPos"
+
+    def get_labler(self):
+        return self.labler
+
+
+class PredictFluThreeClass(ActivityTask):
+    """Three-class flu classification task.
+
+    Labels:
+        0 — Nonsymptomatic  : no flu test on this date
+        1 — Tested Negative : flu test result NOT Detected
+        2 — Tested Positive : flu test result Detected
+    """
+    is_classification = True
+
+    def __init__(self, fields: List[str] = DEFAULT_FIELDS, activity_level: str = "minute",
+                 window_onset_max: int = 0, window_onset_min: int = 0,
+                 **kwargs):
+
+        self.labler = FluThreeClassLabler(window_onset_max=window_onset_max,
+                                          window_onset_min=window_onset_min)
+
+        ActivityTask.__init__(self, fields=fields, activity_level=activity_level, **kwargs)
+        self.is_classification = True
+        ClassificationMixin.__init__(self)
+
+    def get_name(self):
+        return "PredictFluThreeClass"
 
     def get_labler(self):
         return self.labler

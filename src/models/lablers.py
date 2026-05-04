@@ -77,6 +77,70 @@ class FluPosLabler(object):
         return set([(x[0], x[1].normalize()) for x in self.result_lookup.keys()])
 
 
+class FluThreeClassLabler(object):
+    """Three-way classification labeler for flu detection.
+
+    Labels:
+        0 — Nonsymptomatic  : no flu test recorded on this date (never sought testing)
+        1 — Tested Negative : had a flu test (Influenza A or B) but result was NOT Detected
+        2 — Tested Positive : had a flu test and result was Detected
+
+    The distinction between 0 and 1 captures the difference between participants
+    who were truly asymptomatic vs those who sought care but were flu-negative.
+
+    Parameters
+    ----------
+    window_onset_min : int
+        Days before the test date to also label as positive (default 0).
+    window_onset_max : int
+        Days after the test date to also label as positive (default 0).
+        Both window params apply only to the Tested Positive class to match
+        FluPosLabler behaviour; Tested Negative is always the exact test date.
+    """
+
+    NONSYMPTOMATIC  = 0
+    TESTED_NEGATIVE = 1
+    TESTED_POSITIVE = 2
+
+    def __init__(self, window_onset_min=0, window_onset_max=0):
+        flus = ["Influenza A (Flu A)", "Influenza B (Flu B)"]
+
+        # Load ALL flu test results (positive and negative)
+        reader = LabResultsReader()
+        all_results = reader.results.copy()
+        all_results["_date"] = pd.to_datetime(all_results["trigger_datetime"].dt.date)
+        all_results = all_results[all_results["test_name"].isin(flus)]
+        all_results["is_pos"] = all_results["result"] == "Detected"
+
+        # Tested Negative lookup — exact test date, result != Detected
+        neg_tested = all_results[~all_results["is_pos"]].reset_index()
+        self.tested_neg_lookup = set(zip(
+            neg_tested["participant_id"],
+            pd.to_datetime(neg_tested["_date"]).dt.normalize(),
+        ))
+
+        # Tested Positive lookup — result == Detected, expanded by window
+        pos_tested = all_results[all_results["is_pos"]].copy()
+        mapper = lambda x: get_dates_around(x, days_minus=window_onset_min, days_plus=window_onset_max)
+        pos_tested["_date"] = pos_tested["_date"].map(mapper)
+        pos_tested = pos_tested.explode("_date").reset_index()
+        self.tested_pos_lookup = set(zip(
+            pos_tested["participant_id"],
+            pd.to_datetime(pos_tested["_date"]).dt.normalize(),
+        ))
+
+    def __call__(self, participant_id, start_date, end_date):
+        key = (participant_id, end_date.normalize())
+        if key in self.tested_pos_lookup:
+            return self.TESTED_POSITIVE
+        if key in self.tested_neg_lookup:
+            return self.TESTED_NEGATIVE
+        return self.NONSYMPTOMATIC
+
+    def get_positive_keys(self):
+        return self.tested_pos_lookup
+
+
 class FluPosWeakLabler(object):
     def __init__(self, survey_responses, data_location=None, window_size=7, normalize=True, window_onset_min = 0, window_onset_max = 0):
 

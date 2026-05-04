@@ -438,7 +438,7 @@ from src.data.pred_dataset import *
 DSETS = [
     'ettm1', 'ettm2', 'etth1', 'etth2',
     'electricity', 'traffic', 'illness',
-    'weather', 'exchange', 'Wearable'
+    'weather', 'exchange', 'Wearable', 'Wearable_3class'
 ]
 
 
@@ -728,6 +728,32 @@ def get_dls(params, test_only=False):
              label_filter=getattr(params, 'label_filter', 'all'),
              neg_subsample_ratio=getattr(params, 'neg_subsample_ratio', 0),
              seed=getattr(params, 'seed', 42),
+        )
+
+    elif params.dset == 'Wearable_3class':
+        import sys
+        root = "/home/hice1/ezg6/projects/Homekit2020/src"
+        if root not in sys.path:
+            sys.path.insert(0, root)
+
+        from models.tasks import PredictFluThreeClass
+
+        dls = DataLoadersV2(
+            taskCls=PredictFluThreeClass,
+            task_kwargs={
+                "train_path": "/home/hice1/ezg6/projects/Homekit2020/data/processed/split_2020_02_10_by_userFull/train_7_day",
+                "val_path":   "/home/hice1/ezg6/projects/Homekit2020/data/processed/split_2020_02_10_by_userFull/eval_7_day",
+                "test_path":  "/home/hice1/ezg6/projects/Homekit2020/data/processed/split_2020_02_10_by_userFull/test_7_day",
+                "window_onset_min": 0,
+                "window_onset_max": 0,
+            },
+            batch_size=params.batch_size,
+            autoencoder_label=False,
+            workers=params.num_workers,
+            splits=('test',) if test_only else ('train', 'val', 'test'),
+            label_filter=getattr(params, 'label_filter', 'all'),
+            neg_subsample_ratio=getattr(params, 'neg_subsample_ratio', 0),
+            seed=getattr(params, 'seed', 42),
         )
 
     # --------------------------------------------------------------

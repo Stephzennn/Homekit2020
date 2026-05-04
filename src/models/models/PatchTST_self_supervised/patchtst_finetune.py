@@ -19,7 +19,10 @@ from src.models.patchTST import PatchTST
 from src.learner import Learner, transfer_weights
 
 from src.callback.core import *
-from src.callback.tracking import *
+from src.callback.tracking import (
+    TrackTimerCB, TrackTrainingCB, PrintResultsCB, TerminateOnNaNCB,
+    TrackerCB, SaveModelCB, EarlyStoppingCB, WandbCB,
+)
 from src.callback.patch_mask import *
 from src.callback.transforms import *
 
@@ -81,16 +84,23 @@ class ValidationROCAUCCB(Callback):
             preds = torch.cat(all_preds)
             targs = torch.cat(all_targs)
 
-        probs = torch.sigmoid(preds).numpy().reshape(-1)
         y_true = targs.numpy().reshape(-1)
 
-        if len(np.unique(y_true)) < 2:
-            # Validation split has only one class — metrics are undefined.
+        if args.target_points > 1:
+            # Multiclass: softmax over logits, evaluate flu-positive (class 2) vs rest
+            softmax_probs = torch.softmax(preds, dim=-1).numpy()
+            probs = softmax_probs[:, 2]          # P(Tested Positive)
+            flu_true = (y_true == 2).astype(int) # binary: flu-pos vs everything else
+        else:
+            probs = torch.sigmoid(preds).numpy().reshape(-1)
+            flu_true = y_true
+
+        if len(np.unique(flu_true)) < 2:
             roc_auc = 0.0
             pr_auc = 0.0
         else:
-            roc_auc = roc_auc_score(y_true, probs)
-            pr_auc = average_precision_score(y_true, probs)
+            roc_auc = roc_auc_score(flu_true, probs)
+            pr_auc = average_precision_score(flu_true, probs)
 
         self.learner.recorder['valid_roc_auc'].append(roc_auc)
         self.learner.recorder['valid_pr_auc'].append(pr_auc)
@@ -137,6 +147,56 @@ class GeneralizationSaveModelCB(SaveModelCB):
                     f'Epoch {self.epoch}: valid_loss ({valid_loss:.6f}) > '
                     f'train_loss ({train_loss:.6f}) — skipping save (overfitting guard)'
                 )
+
+
+# ------------------------------------------------------------------
+# Overfitting early-stop callback
+# Stops training when valid_loss > train_loss * gap_factor for
+# `patience` consecutive epochs. Complements EarlyStoppingCB
+# (which stops on plateau) by also catching runaway overfitting.
+# ------------------------------------------------------------------
+class OverfitEarlyStoppingCB(Callback):
+    """Stop training when validation loss consistently exceeds training loss.
+
+    Parameters
+    ----------
+    gap_factor : float
+        Raise alarm when valid_loss > train_loss * gap_factor.
+        Default 1.5 = stop when val loss is 50% worse than train loss.
+    patience : int
+        How many consecutive epochs the gap must persist before stopping.
+    """
+    def __init__(self, gap_factor=1.5, patience=5):
+        super().__init__()
+        self.gap_factor = gap_factor
+        self.patience   = patience
+
+    def before_fit(self):
+        self._consecutive = 0
+
+    def after_epoch(self):
+        if self.run_finder:
+            return
+        recorder = self.learner.recorder
+        if not recorder.get('train_loss') or not recorder.get('valid_loss'):
+            return
+        train_loss = recorder['train_loss'][-1]
+        valid_loss = recorder['valid_loss'][-1]
+        if valid_loss > train_loss * self.gap_factor:
+            self._consecutive += 1
+            _rank = int(os.environ.get("RANK", 0))
+            if _rank == 0:
+                print(
+                    f'Epoch {self.epoch}: overfit guard — valid_loss ({valid_loss:.6f}) > '
+                    f'train_loss ({train_loss:.6f}) × {self.gap_factor} '
+                    f'[{self._consecutive}/{self.patience}]'
+                )
+            if self._consecutive >= self.patience:
+                if _rank == 0:
+                    print('Overfitting threshold reached — stopping training.')
+                raise KeyboardInterrupt
+        else:
+            self._consecutive = 0
 
 
 # ------------------------------------------------------------------
@@ -197,6 +257,15 @@ parser.add_argument('--neg_subsample_ratio', type=int, default=0,
                     help='keep this many negatives per positive in the training set; 0 = disabled (use all)')
 parser.add_argument('--seed', type=int, default=42,
                     help='random seed for negative undersampling')
+parser.add_argument('--early_stop_patience', type=int, default=0,
+                    help='stop if valid_loss does not improve for this many epochs; 0 = disabled')
+parser.add_argument('--overfit_patience', type=int, default=0,
+                    help='stop if valid_loss > train_loss * overfit_gap_factor for this many epochs; 0 = disabled')
+parser.add_argument('--overfit_gap_factor', type=float, default=1.5,
+                    help='ratio threshold for OverfitEarlyStoppingCB (default 1.5)')
+parser.add_argument('--save_monitor', type=str, default='valid_loss',
+                    choices=['valid_loss', 'valid_pr_auc', 'valid_roc_auc'],
+                    help='metric to monitor for SaveModelCB and EarlyStoppingCB')
 
 parser.add_argument('--use_wandb', type=int, default=0, help='enable Weights & Biases logging (1=yes, 0=no)')
 parser.add_argument('--wandb_project', type=str, default='PatchTST-Wearable', help='wandb project name')
@@ -210,20 +279,37 @@ args = parser.parse_args()
 
 
 def compute_pos_weight(labels, device):
-    """Compute BCEWithLogitsLoss pos_weight from label tensor, capped by args.pos_weight_cap.
+    """Compute loss weights from label tensor.
 
-    pos_weight = n_negatives / n_positives, but capped to avoid gradient
-    instability when the imbalance ratio is extreme (e.g. 2000:1).
-    Use --pos_weight_cap -1 to disable the cap and use the raw ratio.
+    Binary (target_points == 1):
+        Returns BCEWithLogitsLoss pos_weight = n_neg / n_pos, capped by args.pos_weight_cap.
+
+    Multiclass (target_points > 1):
+        Returns CrossEntropyLoss class weights = n_total / (n_classes * n_class_i)
+        for each class, giving higher weight to rarer classes.
     """
-    n_pos = int((labels == 1).sum().item())
-    n_neg = int((labels == 0).sum().item())
-    raw_ratio = n_neg / n_pos
-    capped = raw_ratio if args.pos_weight_cap < 0 else min(raw_ratio, args.pos_weight_cap)
-    if rank == 0:
-        print(f"pos_weight: raw={raw_ratio:.1f}, cap={args.pos_weight_cap}, using={capped:.1f}  "
-              f"(pos={n_pos}, neg={n_neg})")
-    return torch.tensor([capped], dtype=torch.float32, device=device)
+    if args.target_points > 1:
+        # Multiclass class weights: inverse-frequency weighting
+        n_classes = args.target_points
+        n_total = len(labels)
+        weights = []
+        for c in range(n_classes):
+            n_c = int((labels == c).sum().item())
+            w = n_total / (n_classes * n_c) if n_c > 0 else 1.0
+            weights.append(w)
+        if rank == 0:
+            counts = {c: int((labels == c).sum().item()) for c in range(n_classes)}
+            print(f"class_weights (CrossEntropy): {[f'{w:.2f}' for w in weights]}  counts={counts}")
+        return torch.tensor(weights, dtype=torch.float32, device=device)
+    else:
+        n_pos = int((labels == 1).sum().item())
+        n_neg = int((labels == 0).sum().item())
+        raw_ratio = n_neg / n_pos
+        capped = raw_ratio if args.pos_weight_cap < 0 else min(raw_ratio, args.pos_weight_cap)
+        if rank == 0:
+            print(f"pos_weight: raw={raw_ratio:.1f}, cap={args.pos_weight_cap}, using={capped:.1f}  "
+                  f"(pos={n_pos}, neg={n_neg})")
+        return torch.tensor([capped], dtype=torch.float32, device=device)
 
 
 # ------------------------------------------------------------------
@@ -340,36 +426,24 @@ def find_lr(head_type):
     else:
         model = transfer_weights(args.pretrained_model, model)
 
-    # Use the same weighted BCE as training so the LR finder sees a realistic
-    # loss landscape rather than the collapsed all-negative trivial solution.
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     pos_weight = compute_pos_weight(dls.train.dataset.data["label"], device)
-    # Same squeeze wrapper as finetune_func/linear_probe_func — the model
-    # outputs [B, 1] but labels are [B], so we need to reconcile shapes.
-    #
-    # --- Loss options (swap in when ready to experiment) ---
-    # Option A (active): weighted BCE — simple, stable, well-understood.
-    _bce = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    # Option B: Focal Loss — down-weights easy negatives so training focuses
-    # on hard/rare positives. Drop-in replacement, no optimizer change needed.
-    # gamma=2 is the standard value; increase to focus harder on rare cases.
-    # from torchvision.ops import sigmoid_focal_loss
-    # def focal_loss_func(pred, tgt):
-    #     p = pred.squeeze(-1) if (pred.ndim==2 and pred.shape[-1]==1) else pred
-    #     return sigmoid_focal_loss(p, tgt.float(), alpha=0.25, gamma=2, reduction='mean')
-    # Option C: LibAUC AUCMLoss — directly maximises ROC-AUC as training
-    # objective. Requires changing the optimizer to PESG (see finetune_func).
-    # pip install libauc
-    # from libauc.losses import AUCMLoss
-    # _auc_loss = AUCMLoss()
-    # -------------------------------------------------------
+
+    if args.target_points > 1:
+        _criterion = torch.nn.CrossEntropyLoss(weight=pos_weight)
+    else:
+        _criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
     def loss_func(pred, tgt):
-        if pred.shape != tgt.shape:
-            if pred.ndim == 2 and pred.shape[-1] == 1 and tgt.ndim == 1 and pred.shape[0] == tgt.shape[0]:
-                pred = pred.squeeze(-1)
-            else:
-                raise ValueError(f"Cannot reconcile pred shape {pred.shape} with target shape {tgt.shape}")
-        return _bce(pred, tgt.float())
+        if args.target_points > 1:
+            return _criterion(pred, tgt.long())
+        else:
+            if pred.shape != tgt.shape:
+                if pred.ndim == 2 and pred.shape[-1] == 1 and tgt.ndim == 1 and pred.shape[0] == tgt.shape[0]:
+                    pred = pred.squeeze(-1)
+                else:
+                    raise ValueError(f"Cannot reconcile pred shape {pred.shape} with target shape {tgt.shape}")
+            return _criterion(pred, tgt.float())
 
     #cbs = [RevInCB(dls.vars)] if args.revin else []
 
@@ -427,45 +501,40 @@ def finetune_func(lr=args.lr):
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
     pos_weight = compute_pos_weight(dls.train.dataset.data["label"], device)
 
-    # --- Loss options (swap in when ready to experiment) ---
-    # Option A (active): weighted BCE — simple, stable, well-understood.
-    _bce = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    # Option B: Focal Loss — down-weights easy negatives so training focuses
-    # on hard/rare positives. Drop-in replacement, no optimizer change needed.
-    # gamma=2 is the standard value; increase to focus harder on rare cases.
-    # from torchvision.ops import sigmoid_focal_loss
-    # def focal_loss_func(pred, tgt):
-    #     p = pred.squeeze(-1) if (pred.ndim==2 and pred.shape[-1]==1) else pred
-    #     return sigmoid_focal_loss(p, tgt.float(), alpha=0.25, gamma=2, reduction='mean')
-    # Option C: LibAUC AUCMLoss — directly maximises ROC-AUC as training
-    # objective. Requires changing the optimizer to PESG (see below).
-    # pip install libauc
-    # from libauc.losses import AUCMLoss
-    # from libauc.optimizers import PESG
-    # _auc_loss = AUCMLoss()
-    # (also replace opt_func=Adam in Learner with opt_func=PESG if using this)
-    # -------------------------------------------------------
+    # Binary: BCEWithLogitsLoss | Multiclass: CrossEntropyLoss
+    if args.target_points > 1:
+        _criterion = torch.nn.CrossEntropyLoss(weight=pos_weight)
+    else:
+        _criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+
     def loss_func(pred, tgt):
-        if pred.shape != tgt.shape:
-            # Only fix the obvious case: pred is [B, 1] and tgt is [B]
-            if pred.ndim == 2 and pred.shape[-1] == 1 and tgt.ndim == 1 and pred.shape[0] == tgt.shape[0]:
-                pred = pred.squeeze(-1)
-            else:
-                raise ValueError(f"Cannot reconcile pred shape {pred.shape} with target shape {tgt.shape}")
-        return _bce(pred, tgt.float())
+        if args.target_points > 1:
+            # CrossEntropyLoss expects pred: [B, C] and tgt: [B] (long)
+            return _criterion(pred, tgt.long())
+        else:
+            if pred.shape != tgt.shape:
+                if pred.ndim == 2 and pred.shape[-1] == 1 and tgt.ndim == 1 and pred.shape[0] == tgt.shape[0]:
+                    pred = pred.squeeze(-1)
+                else:
+                    raise ValueError(f"Cannot reconcile pred shape {pred.shape} with target shape {tgt.shape}")
+            return _criterion(pred, tgt.float())
 
     #cbs = [RevInCB(dls.vars, denorm=True)] if args.revin else []
     cbs = [RevInCB(dls.vars, denorm=False)] if args.revin else []
 
     cbs += [
         PatchCB(patch_len=args.patch_len, stride=args.stride),
+        TerminateOnNaNCB(),
         # ValidationROCAUCCB must come before SaveModelCB so it populates
         # recorder['valid_roc_auc'] before SaveModelCB.before_fit asserts it.
         ValidationROCAUCCB(),
-        SaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
-        # SaveModelCB(monitor='valid_roc_auc', fname=args.save_finetuned_model, path=args.save_path)
+        SaveModelCB(monitor=args.save_monitor, fname=args.save_finetuned_model, path=args.save_path),
         # GeneralizationSaveModelCB(monitor='valid_loss', fname=args.save_finetuned_model, path=args.save_path)
     ]
+    if args.early_stop_patience > 0:
+        cbs.append(EarlyStoppingCB(monitor=args.save_monitor, patient=args.early_stop_patience))
+    if args.overfit_patience > 0:
+        cbs.append(OverfitEarlyStoppingCB(gap_factor=args.overfit_gap_factor, patience=args.overfit_patience))
 
     if args.use_wandb:
         cbs.append(WandbCB(
@@ -847,13 +916,26 @@ def test_func(weight_path):
     #   Train → find PR-optimal threshold (reference / sanity check)
     #   Val   → find PR-optimal threshold → applied BLIND to test set
     # -------------------------------------------------------------------------
+    def _to_probs_and_labels(raw_preds, raw_targets):
+        """Convert raw logits to flu-positive probabilities and binary flu labels."""
+        preds_arr = np.array(raw_preds)
+        targs_arr = np.array(raw_targets).reshape(-1).astype(int)
+        if args.target_points > 1:
+            # Softmax over class logits; P(Tested Positive) = col 2
+            exp_p = np.exp(preds_arr - preds_arr.max(axis=-1, keepdims=True))
+            softmax_p = exp_p / exp_p.sum(axis=-1, keepdims=True)
+            probs = softmax_p[:, 2]
+            labels = (targs_arr == 2).astype(int)  # flu-pos vs rest
+        else:
+            probs = (1 / (1 + np.exp(-preds_arr.reshape(-1)))).astype(float)
+            labels = targs_arr
+        return probs, labels
+
     train_preds, train_targets = learn.test(dls.train, weight_path=weight_path + '.pth')
-    train_probs = (1 / (1 + np.exp(-np.array(train_preds).reshape(-1)))).astype(float)
-    train_true  = np.array(train_targets).reshape(-1).astype(int)
+    train_probs, train_true    = _to_probs_and_labels(train_preds, train_targets)
 
     val_preds, val_targets = learn.test(dls.valid, weight_path=weight_path + '.pth')
-    val_probs  = (1 / (1 + np.exp(-np.array(val_preds).reshape(-1)))).astype(float)
-    val_true   = np.array(val_targets).reshape(-1).astype(int)
+    val_probs, val_true    = _to_probs_and_labels(val_preds, val_targets)
 
     if len(np.unique(train_true)) >= 2:
         pr_opt_thresh_train, pr_opt_f1_train, _, _, _ = _find_pr_optimal_threshold(train_true, train_probs)
@@ -871,8 +953,7 @@ def test_func(weight_path):
     # Step 2 — Test inference: evaluate blind using val-derived threshold
     # -------------------------------------------------------------------------
     test_preds, test_targets = learn.test(dls.test, weight_path=weight_path + '.pth')
-    probs  = (1 / (1 + np.exp(-np.array(test_preds).reshape(-1)))).astype(float)
-    y_true = np.array(test_targets).reshape(-1).astype(int)
+    probs, y_true = _to_probs_and_labels(test_preds, test_targets)
 
     prevalence = y_true.mean()
     n_pos      = int(y_true.sum())
